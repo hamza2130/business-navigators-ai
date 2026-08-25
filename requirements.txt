@@ -1,0 +1,13 @@
+apscheduler==3.11.3
+fastapi==0.141.1
+google_api_python_client==2.198.0
+groq==1.6.0
+pdf2image==1.17.0
+Pillow==12.3.0
+protobuf==7.35.1
+pydantic==2.13.4
+pypdf==6.16.1
+pytesseract==0.3.13
+python-dotenv==1.2.3
+python_docx==1.2.0
+Requests==2.34.2

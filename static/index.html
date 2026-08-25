@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Business Navigators - Admin Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-black text-white min-h-screen p-6 font-sans">
+    <div class="max-w-6xl mx-auto space-y-6">
+        
+        <!-- Header -->
+        <header class="flex justify-between items-center border-b border-purple-900/50 pb-4">
+            <div>
+                <h1 class="text-2xl font-bold text-purple-400">Business Navigators AI</h1>
+                <p class="text-sm text-zinc-400">Admin Control & Dynamic Knowledge Base</p>
+            </div>
+            <span class="px-3 py-1 bg-purple-950/80 text-purple-300 rounded-full text-xs font-semibold border border-purple-500/30">
+                System Active
+            </span>
+        </header>
+
+        <!-- Main Grid -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            
+            <!-- Knowledge Base Manager -->
+            <div class="bg-zinc-950 border border-purple-900/40 rounded-xl p-5 space-y-4 shadow-lg shadow-purple-950/20">
+                <h2 class="text-lg font-semibold text-purple-200">Knowledge Base Management</h2>
+                
+                <form id="kbForm" class="space-y-3">
+                    <input type="text" id="category" placeholder="Category (e.g. FTA Tax)" class="w-full bg-zinc-900 border border-zinc-800 rounded-lg p-2.5 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-purple-500 transition" required>
+                    <input type="text" id="topic" placeholder="Topic (e.g. Corporate Tax Rate)" class="w-full bg-zinc-900 border border-zinc-800 rounded-lg p-2.5 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-purple-500 transition" required>
+                    <textarea id="content" placeholder="Content details..." rows="3" class="w-full bg-zinc-900 border border-zinc-800 rounded-lg p-2.5 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-purple-500 transition" required></textarea>
+                    <button type="submit" class="w-full bg-purple-600 hover:bg-purple-500 text-white font-medium py-2.5 rounded-lg transition active:scale-[0.99]">
+                        Add Knowledge Item
+                    </button>
+                </form>
+
+                <div class="pt-4 border-t border-zinc-800">
+                    <h3 class="text-sm font-semibold text-zinc-400 mb-3">Active Knowledge Base Items</h3>
+                    <div id="kbList" class="space-y-2 max-h-60 overflow-y-auto pr-1"></div>
+                </div>
+            </div>
+
+            <!-- Agent Takeover Control -->
+            <div class="bg-zinc-950 border border-purple-900/40 rounded-xl p-5 space-y-4 shadow-lg shadow-purple-950/20">
+                <h2 class="text-lg font-semibold text-purple-200">Human Agent Takeover</h2>
+                <p class="text-xs text-zinc-400">Pause or resume automated AI responses for specific lead contact identifiers.</p>
+                
+                <form id="takeoverForm" class="space-y-3">
+                    <input type="text" id="phone_number" placeholder="Identifier (e.g. whatsapp:+923...)" class="w-full bg-zinc-900 border border-zinc-800 rounded-lg p-2.5 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-purple-500 transition" required>
+                    <div class="flex gap-3">
+                        <button type="button" onclick="setTakeover(true)" class="flex-1 bg-purple-900/60 hover:bg-purple-800 border border-purple-600/50 text-purple-200 font-medium py-2.5 rounded-lg transition">
+                            Pause AI (Takeover)
+                        </button>
+                        <button type="button" onclick="setTakeover(false)" class="flex-1 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 text-white font-medium py-2.5 rounded-lg transition">
+                            Resume AI
+                        </button>
+                    </div>
+                </form>
+                <div id="takeoverStatus" class="text-xs font-mono text-purple-300 mt-2"></div>
+            </div>
+
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = "";
+
+        async function loadKB() {
+            const res = await fetch(`${API_BASE}/admin/knowledge-base`);
+            const json = await res.json();
+            const container = document.getElementById("kbList");
+            container.innerHTML = "";
+            
+            json.data.forEach(item => {
+                const el = document.createElement("div");
+                el.className = "bg-zinc-900 p-3 rounded-lg border border-purple-900/30 text-xs flex justify-between items-start";
+                el.innerHTML = `
+                    <div>
+                        <span class="text-purple-400 font-semibold">[${item.category}]</span>
+                        <span class="text-white font-medium ml-1">${item.topic}</span>
+                        <p class="text-zinc-400 mt-1">${item.content}</p>
+                    </div>
+                    <button onclick="deleteKB(${item.id})" class="text-purple-400 hover:text-red-400 ml-2 font-bold text-sm transition">×</button>
+                `;
+                container.appendChild(el);
+            });
+        }
+
+        document.getElementById("kbForm").onsubmit = async (e) => {
+            e.preventDefault();
+            const payload = {
+                category: document.getElementById("category").value,
+                topic: document.getElementById("topic").value,
+                content: document.getElementById("content").value,
+                is_active: true
+            };
+            await fetch(`${API_BASE}/admin/knowledge-base`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+            });
+            document.getElementById("kbForm").reset();
+            loadKB();
+        };
+
+        async function deleteKB(id) {
+            await fetch(`${API_BASE}/admin/knowledge-base/${id}`, { method: "DELETE" });
+            loadKB();
+        }
+
+        async function setTakeover(enable) {
+            const identifier = document.getElementById("phone_number").value;
+            if (!identifier) return;
+            
+            const formData = new FormData();
+            formData.append("phone_number", identifier);
+            formData.append("enable", enable);
+
+            const res = await fetch(`${API_BASE}/admin/takeover`, { method: "POST", body: formData });
+            const json = await res.json();
+            document.getElementById("takeoverStatus").innerText = json.message;
+        }
+
+        loadKB();
+    </script>
+</body>
+</html>
