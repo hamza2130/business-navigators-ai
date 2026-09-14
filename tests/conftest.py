@@ -53,6 +53,10 @@ def reset_recorder():
 # --------------------------------------------------------------------------
 AI_REPLY = "Thank you for contacting Business Navigators. How may I assist?"
 GROQ_SHOULD_FAIL = {"value": False}
+# Override for tests that need the stub to emit a specific reply (e.g. one
+# carrying a <<<LEAD_DATA>>> block to exercise FR-3 extraction). None means
+# "use AI_REPLY as-is".
+AI_REPLY_OVERRIDE = {"value": None}
 
 
 class _Msg:
@@ -75,7 +79,8 @@ class _Completions:
         if GROQ_SHOULD_FAIL["value"]:
             raise RuntimeError("simulated Groq outage")
         OUT["groq"].append(kwargs)
-        return _Completion(AI_REPLY)
+        reply = AI_REPLY_OVERRIDE["value"] if AI_REPLY_OVERRIDE["value"] is not None else AI_REPLY
+        return _Completion(reply)
 
 
 class _Chat:
@@ -247,6 +252,7 @@ def app_env(tmp_path, monkeypatch):
     OCR_DELAY["seconds"] = 0.0
     CALENDAR_SHOULD_FAIL["value"] = False
     GROQ_SHOULD_FAIL["value"] = False
+    AI_REPLY_OVERRIDE["value"] = None
 
     import main
 

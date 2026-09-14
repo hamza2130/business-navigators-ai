@@ -27,17 +27,27 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
-from ai_service import AIServiceError, FALLBACK_REPLY, generate_ai_response
+import scoring_service
+from ai_service import AIServiceError, FALLBACK_REPLY, generate_ai_response, strip_lead_data
 from calendar_service import create_calendar_event
 from config import settings
 from database import (
+    add_booking_keyword,
+    add_scoring_rule,
+    delete_booking_keyword,
+    delete_scoring_rule,
+    get_all_app_settings,
     get_db_connection,
     get_lead,
     get_recent_messages,
     init_db,
     is_duplicate_message,
+    list_booking_keywords,
+    list_leads,
+    list_scoring_rules,
     save_message,
     save_or_update_lead,
+    set_app_setting,
     set_human_takeover,
     update_lead_state_and_score,
 )
@@ -179,6 +189,20 @@ class KBItem(BaseModel):
     is_active: bool = True
 
 
+class ScoringRuleItem(BaseModel):
+    keyword: str
+    weight: int
+
+
+class BookingKeywordItem(BaseModel):
+    keyword: str
+
+
+class AppSettingItem(BaseModel):
+    key: str
+    value: str
+
+
 @app.get("/")
 def read_root():
     return {
@@ -317,6 +341,79 @@ def delete_kb_item(item_id: int):
     return {"status": "success", "message": f"Item {item_id} deleted"}
 
 
+# ==========================================
+# ADMIN LEAD LIST (FR-12, partial: no transcripts/KPIs yet)
+# ==========================================
+@app.get("/admin/leads", dependencies=[Depends(require_admin_key)])
+def get_leads():
+    """Staff-facing lead list: identifier, state, score/tier, and the
+    structured fields the AI has extracted from conversation so far."""
+    return {"status": "success", "data": list_leads()}
+
+
+@app.get("/admin/leads/{identifier}", dependencies=[Depends(require_admin_key)])
+def get_lead_detail(identifier: str):
+    lead = get_lead(identifier)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return {"status": "success", "data": lead}
+
+
+# ==========================================
+# ADMIN SCORING RULES & BOOKING KEYWORDS (FR-4)
+# ==========================================
+@app.get("/admin/scoring-rules", dependencies=[Depends(require_admin_key)])
+def get_scoring_rules():
+    """Every active rule adds its weight to a lead's score whenever its
+    keyword appears (case-insensitive substring) in a message - editable
+    here instead of requiring a code change and redeploy."""
+    return {"status": "success", "data": list_scoring_rules()}
+
+
+@app.post("/admin/scoring-rules", dependencies=[Depends(require_admin_key)])
+def upsert_scoring_rule(item: ScoringRuleItem):
+    rule_id = add_scoring_rule(item.keyword, item.weight)
+    return {"status": "success", "message": "Scoring rule saved", "id": rule_id}
+
+
+@app.delete("/admin/scoring-rules/{rule_id}", dependencies=[Depends(require_admin_key)])
+def remove_scoring_rule(rule_id: int):
+    delete_scoring_rule(rule_id)
+    return {"status": "success", "message": f"Rule {rule_id} deleted"}
+
+
+@app.get("/admin/booking-keywords", dependencies=[Depends(require_admin_key)])
+def get_booking_keywords():
+    """Any of these appearing in a message triggers the calendar-booking
+    flow (FR-5), independent of the scoring rules above."""
+    return {"status": "success", "data": list_booking_keywords()}
+
+
+@app.post("/admin/booking-keywords", dependencies=[Depends(require_admin_key)])
+def upsert_booking_keyword(item: BookingKeywordItem):
+    rule_id = add_booking_keyword(item.keyword)
+    return {"status": "success", "message": "Booking keyword saved", "id": rule_id}
+
+
+@app.delete("/admin/booking-keywords/{rule_id}", dependencies=[Depends(require_admin_key)])
+def remove_booking_keyword(rule_id: int):
+    delete_booking_keyword(rule_id)
+    return {"status": "success", "message": f"Keyword {rule_id} deleted"}
+
+
+@app.get("/admin/settings", dependencies=[Depends(require_admin_key)])
+def get_settings():
+    """hot_threshold / medium_threshold (Hot/Medium/Low score cutoffs) and
+    base_engagement_boost (flat per-message score) - see scoring_service.py."""
+    return {"status": "success", "data": get_all_app_settings()}
+
+
+@app.post("/admin/settings", dependencies=[Depends(require_admin_key)])
+def update_setting(item: AppSettingItem):
+    set_app_setting(item.key, item.value)
+    return {"status": "success", "message": f"{item.key} updated"}
+
+
 def _build_booking_slot() -> tuple[str, str]:
     """Tomorrow at 10:00 Asia/Dubai, as naive local-time strings.
 
@@ -347,22 +444,21 @@ def process_message_intent(
 
     Raises AIServiceError if the LLM call itself fails - callers must catch
     this and must NOT advance lead state or persist a reply on that path.
-    """
-    score_boost = 5
-    intent_keywords = [
-        "setup", "compliance", "growth", "tax", "license", "consultation",
-        "booking", "visa", "cost", "appointment", "schedule", "meet",
-        "expire", "expiry", "expiration", "document",
-    ]
-    booking_keywords = [
-        "book", "booking", "appointment", "schedule", "meet", "meeting", "call",
-    ]
 
-    has_high_intent = any(kw in user_query.lower() for kw in intent_keywords)
-    wants_booking = any(kw in user_query.lower() for kw in booking_keywords)
+    Returns (ai_reply, new_state, score_boost, extracted_fields) - the last
+    is whatever structured lead-qualification data (FR-3) the model pulled
+    out of this turn, e.g. {"industry": "e-commerce"}. Always a dict, empty
+    if nothing new was mentioned.
+    """
+    # Scoring rules and booking-trigger keywords are staff-editable via the
+    # dashboard (see database.py's scoring_rules/booking_keywords tables
+    # and scoring_service.py) rather than hardcoded here.
+    base_boost, matched_weight = scoring_service.score_breakdown(user_query)
+    score_boost = base_boost + matched_weight
+    has_high_intent = matched_weight > 0
+    wants_booking = scoring_service.wants_booking(user_query)
 
     if has_high_intent:
-        score_boost += 15
         new_state = (
             "QUALIFIED" if (current_score + score_boost) >= 50 else "ENGAGED"
         )
@@ -413,8 +509,9 @@ def process_message_intent(
         f"Respond professionally guiding them on UAE corporate services.{booking_instruction}"
     )
 
-    ai_reply = generate_ai_response(prompt, conversation_history=conversation_history)
-    return ai_reply, new_state, score_boost
+    raw_reply = generate_ai_response(prompt, conversation_history=conversation_history)
+    ai_reply, extracted_fields = strip_lead_data(raw_reply)
+    return ai_reply, new_state, score_boost, extracted_fields
 
 
 # ==========================================
@@ -523,10 +620,15 @@ def _process_whatsapp_message(
                 f"and ask how Business Navigators can assist them further."
             )
             try:
-                ai_reply = generate_ai_response(prompt)
+                raw_reply = generate_ai_response(prompt)
             except AIServiceError:
                 send_whatsapp_message(phone_number, FALLBACK_REPLY)
                 return
+            # Discard any extracted fields here - document confirmation
+            # isn't the FR-3 qualification flow - but still strip the
+            # sentinel block so raw JSON never leaks into what the client
+            # sees (the shared system prompt appends it to every reply).
+            ai_reply, _ = strip_lead_data(raw_reply)
             notification_payload = f"[Document Recd | Expiry: {expiry_date}] Snippet: {extracted_text[:100]}..."
         else:
             new_state = current_state
@@ -535,7 +637,7 @@ def _process_whatsapp_message(
         save_message(phone_number, "whatsapp", "assistant", ai_reply)
     else:
         try:
-            ai_reply, new_state, score_boost = process_message_intent(
+            ai_reply, new_state, score_boost, extracted_fields = process_message_intent(
                 phone_number,
                 user_query,
                 current_state,
@@ -552,6 +654,11 @@ def _process_whatsapp_message(
         update_lead_state_and_score(
             phone_number=phone_number, state=new_state, score_delta=score_boost
         )
+        # Persist whatever qualification fields (FR-3) the model pulled out
+        # of this turn, and refresh the Hot/Medium/Low tier (FR-4) now that
+        # the score has moved.
+        new_tier = scoring_service.compute_lead_tier(current_score + score_boost)
+        save_or_update_lead(phone_number=phone_number, lead_tier=new_tier, **extracted_fields)
         save_message(phone_number, "whatsapp", "assistant", ai_reply)
         notification_payload = user_query
 
@@ -676,7 +783,7 @@ async def email_webhook(request: Request):
     history = get_recent_messages(sender_email, limit=10)
 
     try:
-        ai_reply, new_state, score_boost = process_message_intent(
+        ai_reply, new_state, score_boost, extracted_fields = process_message_intent(
             sender_email,
             body_text,
             current_state,
@@ -691,6 +798,8 @@ async def email_webhook(request: Request):
     update_lead_state_and_score(
         phone_number=sender_email, state=new_state, score_delta=score_boost
     )
+    new_tier = scoring_service.compute_lead_tier(current_score + score_boost)
+    save_or_update_lead(phone_number=sender_email, lead_tier=new_tier, **extracted_fields)
     save_message(sender_email, "email", "user", body_text)
     save_message(sender_email, "email", "assistant", ai_reply)
 

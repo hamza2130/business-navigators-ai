@@ -24,6 +24,7 @@ from conftest import (
     OCR_TEXT,
     OCR_DELAY,
     AI_REPLY,
+    AI_REPLY_OVERRIDE,
     GROQ_SHOULD_FAIL,
     TEST_APP_SECRET,
     TEST_CALENDAR_ID,
@@ -239,13 +240,19 @@ class TestConversation:
 
     def test_duplicate_delivery_is_idempotent(self, client):
         """Meta retries on timeout; the same message id must not be processed twice."""
-        payload = meta_text_payload("971500000010", "I need tax compliance help", "wamid.SAME")
+        import database
+        import scoring_service
+
+        text = "I need tax compliance help"
+        expected_single_delivery_score = scoring_service.compute_score_boost(text)
+
+        payload = meta_text_payload("971500000010", text, "wamid.SAME")
         post_whatsapp_webhook(client, payload)
         second = post_whatsapp_webhook(client, payload)
-        import database
         assert second.json()["status"] == "duplicate"
         assert len(wa_texts()) == 1, f"replied {len(wa_texts())}x to one message"
-        assert database.get_lead("971500000010")["score"] <= 20, "score double-counted"
+        assert database.get_lead("971500000010")["score"] == expected_single_delivery_score, (
+            "score double-counted (or the scoring rules changed under the test)")
 
 
 # ==========================================================================
@@ -554,6 +561,103 @@ def _make_synthetic_request(body: bytes, signature: str):
         return {"type": "http.disconnect"}
 
     return StarletteRequest(scope, receive)
+
+
+# ==========================================================================
+# J. STRUCTURED LEAD QUALIFICATION & SCORING (FR-3, FR-4)
+# ==========================================================================
+class TestLeadQualification:
+    LEAD_DATA_REPLY = (
+        "Sure, I can help with that!\n"
+        '<<<LEAD_DATA>>>{"name": "Ayesha", "business_type": "LLC", "turnover": "500k AED", '
+        '"industry": "e-commerce", "vat_status": "not registered", "service_interest": "company setup"}'
+    )
+
+    def test_structured_fields_are_extracted_into_the_lead_record(self, client):
+        AI_REPLY_OVERRIDE["value"] = self.LEAD_DATA_REPLY
+        post_whatsapp_webhook(client, meta_text_payload("971500000050", "I run an online store, need help setting up"))
+        import database
+        lead = database.get_lead("971500000050")
+        assert lead["name"] == "Ayesha"
+        assert lead["business_type"] == "LLC"
+        assert lead["industry"] == "e-commerce"
+        assert lead["vat_status"] == "not registered"
+        assert lead["service_interest"] == "company setup"
+
+    def test_lead_data_sentinel_never_reaches_the_client(self, client):
+        AI_REPLY_OVERRIDE["value"] = self.LEAD_DATA_REPLY
+        post_whatsapp_webhook(client, meta_text_payload("971500000051", "hello"))
+        sent = wa_texts()
+        assert sent and "<<<LEAD_DATA>>>" not in sent[0]
+        assert '"business_type"' not in sent[0]
+
+    def test_fields_not_mentioned_stay_null_and_dont_overwrite(self, client):
+        """A later turn that only mentions industry must not blank out a
+        name captured on an earlier turn (save_or_update_lead's partial-
+        upsert semantics, exercised end-to-end here)."""
+        AI_REPLY_OVERRIDE["value"] = self.LEAD_DATA_REPLY
+        post_whatsapp_webhook(client, meta_text_payload("971500000052", "msg 1", "m1"))
+        AI_REPLY_OVERRIDE["value"] = (
+            'Got it.\n<<<LEAD_DATA>>>{"name": null, "business_type": null, "turnover": null, '
+            '"industry": "consulting", "vat_status": null, "service_interest": null}'
+        )
+        post_whatsapp_webhook(client, meta_text_payload("971500000052", "msg 2", "m2"))
+        import database
+        lead = database.get_lead("971500000052")
+        assert lead["name"] == "Ayesha", "an earlier-captured field was wiped by a turn that didn't mention it"
+        assert lead["industry"] == "consulting"
+
+    def test_lead_tier_reflects_score(self, client):
+        import database
+        post_whatsapp_webhook(client, meta_text_payload(
+            "971500000053", "I need setup compliance tax license consultation visa help", "m1"))
+        lead = database.get_lead("971500000053")
+        assert lead["lead_tier"] == "HOT", f"score {lead['score']} should classify as HOT, got {lead['lead_tier']}"
+
+    def test_scoring_rules_are_admin_configurable(self, client):
+        """Adding a brand-new keyword through the API must affect scoring
+        on the very next message, with no code change or deploy."""
+        client.post("/admin/scoring-rules", headers=admin_headers(),
+                    json={"keyword": "freezone", "weight": 40})
+        post_whatsapp_webhook(client, meta_text_payload("971500000054", "tell me about freezone options"))
+        import database
+        assert database.get_lead("971500000054")["score"] >= 40
+
+    def test_booking_keywords_are_admin_configurable(self, client):
+        client.post("/admin/booking-keywords", headers=admin_headers(), json={"keyword": "reserve"})
+        post_whatsapp_webhook(client, meta_text_payload("971500000055", "I'd like to reserve a slot"))
+        import database
+        assert database.get_lead("971500000055")["state"] == "MEETING_REQUESTED"
+
+    def test_thresholds_are_admin_configurable(self, client):
+        client.post("/admin/settings", headers=admin_headers(), json={"key": "hot_threshold", "value": "5"})
+        post_whatsapp_webhook(client, meta_text_payload("971500000056", "hi there"))
+        import database
+        lead = database.get_lead("971500000056")
+        assert lead["lead_tier"] == "HOT", "lowering hot_threshold should reclassify a low-scoring lead as HOT"
+
+    def test_admin_leads_list_requires_auth(self, client):
+        assert client.get("/admin/leads").status_code == 401
+
+    def test_admin_leads_list_shows_real_leads(self, client):
+        post_whatsapp_webhook(client, meta_text_payload("971500000057", "hi"))
+        r = client.get("/admin/leads", headers=admin_headers())
+        assert r.status_code == 200
+        identifiers = [l["identifier"] for l in r.json()["data"]]
+        assert "971500000057" in identifiers
+
+    def test_admin_scoring_rules_crud_requires_auth(self, client):
+        assert client.get("/admin/scoring-rules").status_code == 401
+        assert client.post("/admin/scoring-rules", json={"keyword": "x", "weight": 1}).status_code == 401
+        assert client.delete("/admin/scoring-rules/1").status_code == 401
+
+    def test_admin_booking_keywords_crud_requires_auth(self, client):
+        assert client.get("/admin/booking-keywords").status_code == 401
+        assert client.post("/admin/booking-keywords", json={"keyword": "x"}).status_code == 401
+
+    def test_admin_settings_requires_auth(self, client):
+        assert client.get("/admin/settings").status_code == 401
+        assert client.post("/admin/settings", json={"key": "x", "value": "1"}).status_code == 401
 
 
 class TestResilience:

@@ -63,6 +63,17 @@ def init_db() -> None:
                 # from re-sending the same reminder every day after.
                 "reminder_30d_sent_at": "TEXT",
                 "reminder_7d_sent_at": "TEXT",
+                # Structured qualification fields (FR-3) - filled in as the
+                # AI extracts them from natural conversation, rather than
+                # relying on staff to read a transcript to find them.
+                "turnover": "TEXT",
+                "industry": "TEXT",
+                "vat_status": "TEXT",
+                "service_interest": "TEXT",
+                # Hot/Medium/Low classification (FR-4), recomputed from
+                # `score` against admin-configurable thresholds every time
+                # score changes - see scoring_service.compute_lead_tier().
+                "lead_tier": "TEXT",
             }
 
             for col_name, col_def in required_columns.items():
@@ -109,7 +120,87 @@ def init_db() -> None:
                 "WHERE external_message_id IS NOT NULL"
             )
 
+            # 6. Scoring rules (FR-4): keyword -> weight, editable by staff
+            # via the dashboard instead of hardcoded in main.py. Separate
+            # from booking_keywords below - a keyword can independently
+            # score intent AND trigger booking (e.g. "consultation" does
+            # both), so these can't share one UNIQUE(keyword) table.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS scoring_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    keyword TEXT NOT NULL UNIQUE,
+                    weight INTEGER NOT NULL,
+                    is_active INTEGER DEFAULT 1,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS booking_keywords (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    keyword TEXT NOT NULL UNIQUE,
+                    is_active INTEGER DEFAULT 1
+                )
+            """)
+            cursor.execute("SELECT COUNT(*) FROM scoring_rules")
+            if cursor.fetchone()[0] == 0:
+                _seed_default_scoring_rules(cursor)
+            cursor.execute("SELECT COUNT(*) FROM booking_keywords")
+            if cursor.fetchone()[0] == 0:
+                _seed_default_booking_keywords(cursor)
+
+            # 7. Small admin-configurable key/value settings - currently
+            # just the Hot/Medium/Low score thresholds and the flat
+            # per-message engagement boost, but a generic enough shape to
+            # hold future tunables without another migration.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+            for key, default in (
+                ("hot_threshold", "70"),
+                ("medium_threshold", "30"),
+                ("base_engagement_boost", "5"),
+            ):
+                cursor.execute(
+                    "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO NOTHING",
+                    (key, default),
+                )
+
     print("Database initialized successfully with schema migrations.")
+
+
+def _seed_default_scoring_rules(cursor) -> None:
+    """One-time seed matching the keyword list that used to be hardcoded in
+    main.py (each worth the old flat +15), so upgrading an existing
+    deployment doesn't silently zero out its scoring behaviour. Staff can
+    edit/remove/add to these afterwards via the dashboard - this only runs
+    when the table is empty."""
+    intent_keywords = [
+        "setup", "compliance", "growth", "tax", "license", "consultation",
+        "booking", "visa", "cost", "appointment", "schedule", "meet",
+        "expire", "expiry", "expiration", "document",
+    ]
+    cursor.executemany(
+        "INSERT INTO scoring_rules (keyword, weight) VALUES (?, ?) "
+        "ON CONFLICT(keyword) DO NOTHING",
+        [(kw, 15) for kw in intent_keywords],
+    )
+
+
+def _seed_default_booking_keywords(cursor) -> None:
+    """One-time seed matching the keyword list that used to be hardcoded in
+    main.py for triggering the calendar-booking flow."""
+    booking_keywords = [
+        "book", "booking", "appointment", "schedule", "meet", "meeting", "call",
+    ]
+    cursor.executemany(
+        "INSERT INTO booking_keywords (keyword) VALUES (?) "
+        "ON CONFLICT(keyword) DO NOTHING",
+        [(kw,) for kw in booking_keywords],
+    )
 
 
 def get_lead(phone_number: str) -> dict | None:
@@ -119,13 +210,32 @@ def get_lead(phone_number: str) -> dict | None:
         cursor.execute(
             """
             SELECT phone_number AS identifier, state, score, name, business_type,
-                   document_id_number, document_expiry_date, document_status, human_takeover
+                   document_id_number, document_expiry_date, document_status, human_takeover,
+                   turnover, industry, vat_status, service_interest, lead_tier
             FROM leads WHERE phone_number = ?
             """,
             (phone_number,),
         )
         row = cursor.fetchone()
         return dict(row) if row else None
+
+
+def list_leads(limit: int = 200) -> list[dict]:
+    """All leads for the staff dashboard's lead list, most recently
+    active first (by rowid, since SQLite has no updated_at on this table
+    without another migration - good enough for a MVP-scale list)."""
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT phone_number AS identifier, state, score, name, business_type,
+                   document_expiry_date, document_status, human_takeover,
+                   turnover, industry, vat_status, service_interest, lead_tier
+            FROM leads ORDER BY rowid DESC LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def set_human_takeover(phone_number: str, status: bool) -> None:
@@ -181,6 +291,11 @@ def save_or_update_lead(
     document_expiry_date: str = None,
     document_status: str = None,
     human_takeover: int = None,
+    turnover: str = None,
+    industry: str = None,
+    vat_status: str = None,
+    service_interest: str = None,
+    lead_tier: str = None,
 ) -> None:
     """Partial upsert: only the fields explicitly passed (non-None) are
     written. A field left as None is untouched on an existing lead, and
@@ -212,6 +327,11 @@ def save_or_update_lead(
                     document_expiry_date = COALESCE(?, document_expiry_date),
                     document_status = COALESCE(?, document_status),
                     human_takeover = COALESCE(?, human_takeover),
+                    turnover = COALESCE(?, turnover),
+                    industry = COALESCE(?, industry),
+                    vat_status = COALESCE(?, vat_status),
+                    service_interest = COALESCE(?, service_interest),
+                    lead_tier = COALESCE(?, lead_tier),
                     reminder_30d_sent_at = CASE WHEN ? IS NOT NULL THEN NULL ELSE reminder_30d_sent_at END,
                     reminder_7d_sent_at = CASE WHEN ? IS NOT NULL THEN NULL ELSE reminder_7d_sent_at END
                 WHERE phone_number = ?
@@ -225,6 +345,11 @@ def save_or_update_lead(
                     document_expiry_date,
                     document_status,
                     human_takeover,
+                    turnover,
+                    industry,
+                    vat_status,
+                    service_interest,
+                    lead_tier,
                     document_expiry_date,
                     document_expiry_date,
                     phone_number,
@@ -302,3 +427,108 @@ def get_recent_messages(identifier: str, limit: int = 10) -> list[dict]:
         )
         rows = cursor.fetchall()
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+# ==========================================================================
+# Scoring rules & booking keywords (FR-4: admin-configurable, no deploy
+# needed to add/remove/reweight a keyword)
+# ==========================================================================
+def get_active_scoring_rules() -> list[tuple[str, int]]:
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT keyword, weight FROM scoring_rules WHERE is_active = 1"
+        )
+        return [(row["keyword"], row["weight"]) for row in cursor.fetchall()]
+
+
+def list_scoring_rules() -> list[dict]:
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, keyword, weight, is_active, updated_at FROM scoring_rules ORDER BY weight DESC"
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def add_scoring_rule(keyword: str, weight: int) -> int:
+    with closing(get_db_connection()) as conn:
+        with conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO scoring_rules (keyword, weight) VALUES (?, ?)
+                ON CONFLICT(keyword) DO UPDATE SET weight = excluded.weight,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (keyword.lower().strip(), weight),
+            )
+            cursor.execute("SELECT id FROM scoring_rules WHERE keyword = ?", (keyword.lower().strip(),))
+            return cursor.fetchone()["id"]
+
+
+def delete_scoring_rule(rule_id: int) -> None:
+    with closing(get_db_connection()) as conn:
+        with conn:
+            conn.execute("DELETE FROM scoring_rules WHERE id = ?", (rule_id,))
+
+
+def get_active_booking_keywords() -> list[str]:
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT keyword FROM booking_keywords WHERE is_active = 1")
+        return [row["keyword"] for row in cursor.fetchall()]
+
+
+def list_booking_keywords() -> list[dict]:
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, keyword, is_active FROM booking_keywords ORDER BY keyword")
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def add_booking_keyword(keyword: str) -> int:
+    with closing(get_db_connection()) as conn:
+        with conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO booking_keywords (keyword) VALUES (?) "
+                "ON CONFLICT(keyword) DO UPDATE SET is_active = 1",
+                (keyword.lower().strip(),),
+            )
+            cursor.execute("SELECT id FROM booking_keywords WHERE keyword = ?", (keyword.lower().strip(),))
+            return cursor.fetchone()["id"]
+
+
+def delete_booking_keyword(rule_id: int) -> None:
+    with closing(get_db_connection()) as conn:
+        with conn:
+            conn.execute("DELETE FROM booking_keywords WHERE id = ?", (rule_id,))
+
+
+# ==========================================================================
+# App settings (score-tier thresholds, etc.)
+# ==========================================================================
+def get_app_setting(key: str, default: str = None) -> str | None:
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM app_settings WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        return row["value"] if row else default
+
+
+def get_all_app_settings() -> dict:
+    with closing(get_db_connection()) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT key, value FROM app_settings")
+        return {row["key"]: row["value"] for row in cursor.fetchall()}
+
+
+def set_app_setting(key: str, value: str) -> None:
+    with closing(get_db_connection()) as conn:
+        with conn:
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
