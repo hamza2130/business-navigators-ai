@@ -67,23 +67,55 @@
     <script>
         const API_BASE = "";
 
+        // The admin key that got us past the /dashboard gate (passed as
+        // ?key=... in the URL) is reused as X-Admin-Key on every API call -
+        // the /admin/* routes are protected by the same key server-side.
+        const ADMIN_KEY = new URLSearchParams(window.location.search).get("key") || "";
+        const authHeaders = (extra = {}) => ({ "X-Admin-Key": ADMIN_KEY, ...extra });
+
+        async function apiFetch(url, options = {}) {
+            const res = await fetch(url, {
+                ...options,
+                headers: authHeaders(options.headers || {}),
+            });
+            if (res.status === 401) {
+                document.body.innerHTML =
+                    '<div class="p-8 text-center text-red-400 font-mono">' +
+                    'Missing or invalid admin key. Open this dashboard as ' +
+                    '<code>/dashboard/?key=&lt;your ADMIN_API_KEY&gt;</code>.</div>';
+                throw new Error("unauthorized");
+            }
+            return res;
+        }
+
         async function loadKB() {
-            const res = await fetch(`${API_BASE}/admin/knowledge-base`);
+            const res = await apiFetch(`${API_BASE}/admin/knowledge-base`);
             const json = await res.json();
             const container = document.getElementById("kbList");
             container.innerHTML = "";
-            
+
             json.data.forEach(item => {
                 const el = document.createElement("div");
                 el.className = "bg-zinc-900 p-3 rounded-lg border border-purple-900/30 text-xs flex justify-between items-start";
-                el.innerHTML = `
-                    <div>
-                        <span class="text-purple-400 font-semibold">[${item.category}]</span>
-                        <span class="text-white font-medium ml-1">${item.topic}</span>
-                        <p class="text-zinc-400 mt-1">${item.content}</p>
-                    </div>
-                    <button onclick="deleteKB(${item.id})" class="text-purple-400 hover:text-red-400 ml-2 font-bold text-sm transition">×</button>
-                `;
+
+                const textWrap = document.createElement("div");
+                const catSpan = document.createElement("span");
+                catSpan.className = "text-purple-400 font-semibold";
+                catSpan.textContent = `[${item.category}]`;
+                const topicSpan = document.createElement("span");
+                topicSpan.className = "text-white font-medium ml-1";
+                topicSpan.textContent = item.topic;
+                const contentP = document.createElement("p");
+                contentP.className = "text-zinc-400 mt-1";
+                contentP.textContent = item.content;
+                textWrap.append(catSpan, topicSpan, contentP);
+
+                const delBtn = document.createElement("button");
+                delBtn.className = "text-purple-400 hover:text-red-400 ml-2 font-bold text-sm transition";
+                delBtn.textContent = "×";
+                delBtn.onclick = () => deleteKB(item.id);
+
+                el.append(textWrap, delBtn);
                 container.appendChild(el);
             });
         }
@@ -96,7 +128,7 @@
                 content: document.getElementById("content").value,
                 is_active: true
             };
-            await fetch(`${API_BASE}/admin/knowledge-base`, {
+            await apiFetch(`${API_BASE}/admin/knowledge-base`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(payload)
@@ -106,19 +138,19 @@
         };
 
         async function deleteKB(id) {
-            await fetch(`${API_BASE}/admin/knowledge-base/${id}`, { method: "DELETE" });
+            await apiFetch(`${API_BASE}/admin/knowledge-base/${id}`, { method: "DELETE" });
             loadKB();
         }
 
         async function setTakeover(enable) {
             const identifier = document.getElementById("phone_number").value;
             if (!identifier) return;
-            
+
             const formData = new FormData();
             formData.append("phone_number", identifier);
             formData.append("enable", enable);
 
-            const res = await fetch(`${API_BASE}/admin/takeover`, { method: "POST", body: formData });
+            const res = await apiFetch(`${API_BASE}/admin/takeover`, { method: "POST", body: formData });
             const json = await res.json();
             document.getElementById("takeoverStatus").innerText = json.message;
         }
