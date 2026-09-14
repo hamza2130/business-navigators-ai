@@ -4,19 +4,51 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
 class Settings:
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 
     # Meta WhatsApp Cloud API
-    META_WA_TOKEN: str = os.getenv("META_WA_TOKEN", "")
-    META_PHONE_NUMBER_ID: str = os.getenv("META_PHONE_NUMBER_ID", "")
-    META_VERIFY_TOKEN: str = os.getenv("VERIFY_TOKEN", "my_secret_fastapi_verify_token")
+    WHATSAPP_TOKEN: str = os.getenv("WHATSAPP_TOKEN", "")
+    WHATSAPP_PHONE_NUMBER_ID: str = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+    META_VERIFY_TOKEN: str = os.getenv("META_VERIFY_TOKEN", "")
     META_API_VERSION: str = os.getenv("META_API_VERSION", "v20.0")
+    # App secret from the Meta developer console, used to verify the
+    # X-Hub-Signature-256 header on every inbound webhook POST. Without this,
+    # anyone who finds the webhook URL can forge messages on your behalf.
+    META_APP_SECRET: str = os.getenv("META_APP_SECRET", "")
 
     BREVO_API_KEY: str = os.getenv("BREVO_API_KEY", "")
     SENDER_EMAIL: str = os.getenv("SENDER_EMAIL", "")
-    
-    # Milestone 1: Meeting booking link
-    BOOKING_LINK: str = os.getenv("BOOKING_LINK", "https://calendly.com/your-business-navigators/consultation")
+    # Shared secret expected as a query param / header on the Brevo inbound
+    # email webhook (Brevo has no built-in HMAC signature for inbound parse).
+    EMAIL_WEBHOOK_SECRET: str = os.getenv("EMAIL_WEBHOOK_SECRET", "")
+
+    # Meeting booking link
+    BOOKING_LINK: str = os.getenv(
+        "BOOKING_LINK", "https://calendly.com/your-business-navigators/consultation"
+    )
+
+    # Pre-approved WhatsApp Message Templates for the expiry-reminder cron
+    # job. Meta only allows free-form text replies inside the 24h customer
+    # service window - a proactive reminder sent days after the client last
+    # wrote in is OUTSIDE that window and Meta will reject a plain text
+    # send. These must be created and approved in Meta Business Manager
+    # first; until WHATSAPP_TEMPLATE_30D/_7D are set, the scheduler falls
+    # back to plain text with a loud warning (useful for local dev, NOT
+    # sufficient for production).
+    WHATSAPP_TEMPLATE_30D: str = os.getenv("WHATSAPP_TEMPLATE_30D", "")
+    WHATSAPP_TEMPLATE_7D: str = os.getenv("WHATSAPP_TEMPLATE_7D", "")
+    WHATSAPP_TEMPLATE_LANGUAGE: str = os.getenv("WHATSAPP_TEMPLATE_LANGUAGE", "en")
+
+    # Google Calendar
+    GOOGLE_CALENDAR_ID: str = os.getenv("GOOGLE_CALENDAR_ID", "primary")
+    GOOGLE_CREDENTIALS_FILE: str = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
+
+    # Admin API key - required on every /admin/* route and /test-scheduler.
+    # Sent as `X-Admin-Key: <value>`. No default: an empty value means those
+    # routes refuse every request until this is actually configured.
+    ADMIN_API_KEY: str = os.getenv("ADMIN_API_KEY", "")
+
 
 settings = Settings()

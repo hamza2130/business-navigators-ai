@@ -10,13 +10,18 @@ import requests
 
 from config import settings
 
+# Hard cap on any document/media we download or accept for parsing. Without
+# this, a large or malicious upload can exhaust memory/disk on the server -
+# there was previously no limit at all.
+MAX_DOCUMENT_BYTES = 20 * 1024 * 1024  # 20 MB
+
 
 def _download_meta_media(media_id: str) -> tuple:
     """Meta gives you a media_id, not a direct URL. Two-step download:
     1. GET /{media_id} with a Bearer token -> returns a short-lived signed URL
     2. GET that signed URL, also with the Bearer token -> returns the bytes
     """
-    headers = {"Authorization": f"Bearer {settings.META_WA_TOKEN}"}
+    headers = {"Authorization": f"Bearer {settings.WHATSAPP_TOKEN}"}
     lookup_url = f"https://graph.facebook.com/{settings.META_API_VERSION}/{media_id}"
 
     lookup_resp = requests.get(lookup_url, headers=headers, timeout=15)
@@ -27,15 +32,26 @@ def _download_meta_media(media_id: str) -> tuple:
     media_info = lookup_resp.json()
     download_url = media_info.get("url")
     mime_type = media_info.get("mime_type", "")
+    reported_size = media_info.get("file_size")
     if not download_url:
         return b"", ""
+    if reported_size and int(reported_size) > MAX_DOCUMENT_BYTES:
+        print(f"Rejected media {media_id}: reported size {reported_size} exceeds cap")
+        return b"", ""
 
-    file_resp = requests.get(download_url, headers=headers, timeout=30)
+    file_resp = requests.get(download_url, headers=headers, timeout=30, stream=True)
     if file_resp.status_code != 200:
         print(f"Failed to download media file: {file_resp.status_code}")
         return b"", ""
 
-    return file_resp.content, mime_type
+    content = bytearray()
+    for chunk in file_resp.iter_content(chunk_size=65536):
+        content.extend(chunk)
+        if len(content) > MAX_DOCUMENT_BYTES:
+            print(f"Rejected media {media_id}: exceeded {MAX_DOCUMENT_BYTES} byte cap mid-download")
+            return b"", ""
+
+    return bytes(content), mime_type
 
 
 def _parse_bytes_content(content: bytes, content_type: str) -> str:

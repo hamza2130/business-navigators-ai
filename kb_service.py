@@ -1,8 +1,15 @@
 import sqlite3
 
+import database
+
+
 def get_active_knowledge_context() -> str:
     """Fetch all active knowledge base items and format as context for the prompt."""
-    conn = sqlite3.connect("leads.db")
+    # `import database` (not `from database import DB_NAME`) so this always
+    # reads the current value - a plain name import would freeze a copy at
+    # import time, which breaks anything that reconfigures DB_NAME later
+    # (tests included).
+    conn = sqlite3.connect(database.DB_NAME)
     cursor = conn.cursor()
     
     cursor.execute(
