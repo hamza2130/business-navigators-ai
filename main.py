@@ -7,12 +7,12 @@ import re
 import tempfile
 import time
 from collections import defaultdict, deque
-from contextlib import asynccontextmanager, closing
+from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from arq import create_pool
 from fastapi import (
-    BackgroundTasks,
     Depends,
     FastAPI,
     File,
@@ -27,30 +27,42 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
+import database
+import document_store
 import scoring_service
 from ai_service import AIServiceError, FALLBACK_REPLY, generate_ai_response, strip_lead_data
 from calendar_service import create_calendar_event
+from queue_utils import redis_settings_from_url as _redis_settings_from_url
 from config import settings
 from database import (
     add_booking_keyword,
     add_scoring_rule,
+    close_db,
+    create_document,
     delete_booking_keyword,
     delete_scoring_rule,
     get_all_app_settings,
-    get_db_connection,
+    get_document,
     get_lead,
     get_recent_messages,
     init_db,
     is_duplicate_message,
     list_booking_keywords,
+    list_documents_for_lead,
     list_leads,
+    list_pending_documents,
     list_scoring_rules,
+    log_document_access,
+    review_document,
     save_message,
     save_or_update_lead,
     set_app_setting,
     set_human_takeover,
     update_lead_state_and_score,
 )
+from database import add_kb_item as db_add_kb_item
+from database import delete_kb_item as db_delete_kb_item
+from database import list_kb_items as db_list_kb_items
 from document_parser import MAX_DOCUMENT_BYTES, extract_text_from_attachment
 from email_service import send_email_to_lead, send_lead_notification
 from ocr_service import parse_expiry_date
@@ -67,6 +79,8 @@ scheduler = BackgroundScheduler()
 async def lifespan(app: FastAPI):
     # Startup: Initialize DB schema & Start Scheduler
     init_db()
+    document_store.ensure_bucket()
+    app.state.redis_pool = await create_pool(_redis_settings_from_url(settings.REDIS_URL))
 
     # Schedule daily document compliance check at 09:00 AM
     scheduler.add_job(check_expiring_documents, "cron", hour=9, minute=0)
@@ -80,6 +94,8 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     scheduler.shutdown()
+    await app.state.redis_pool.aclose()
+    close_db()
     print("[SERVER] APScheduler shut down.")
 
 
@@ -203,6 +219,12 @@ class AppSettingItem(BaseModel):
     value: str
 
 
+class DocumentReviewItem(BaseModel):
+    status: str  # "APPROVED" or "REJECTED"
+    reviewed_by: str
+    review_note: str | None = None
+
+
 @app.get("/")
 def read_root():
     return {
@@ -263,26 +285,51 @@ async def test_document_upload(
                     raise HTTPException(status_code=413, detail="File too large")
                 buffer.write(chunk)
 
-        extracted_text = extract_text_from_attachment(file_path=temp_file_path)
+        extracted_text, content, content_type = extract_text_from_attachment(
+            file_path=temp_file_path, with_bytes=True
+        )
 
         if not extracted_text:
             return {"status": "failed", "reason": "Text extraction failed on uploaded document."}
 
         expiry_date = parse_expiry_date(extracted_text)
+        doc_status = "VERIFIED" if expiry_date else "FAILED"
+
+        # Store the original file privately in S3 (FR-8) and record it in
+        # the review queue (FR-14) - previously the bytes were discarded
+        # the moment OCR finished, so there was nothing left to review or
+        # re-download later.
+        storage_key = document_store.upload_document(
+            tenant_id=database.DEFAULT_TENANT_ID,
+            lead_phone_number=phone_number,
+            filename=file.filename or "document",
+            content=content,
+            content_type=file.content_type or content_type,
+        )
+        document_id = create_document(
+            lead_phone_number=phone_number,
+            storage_key=storage_key,
+            original_filename=file.filename,
+            content_type=file.content_type or content_type,
+            size_bytes=len(content),
+            extracted_expiry_date=expiry_date,
+            status="PENDING" if expiry_date else "FAILED",
+        )
 
         save_or_update_lead(
             phone_number=phone_number,
             state="DOCUMENT_SUBMITTED",
             score=50,
             document_expiry_date=expiry_date,
-            document_status="VERIFIED" if expiry_date else "FAILED",
+            document_status=doc_status,
         )
 
         updated_lead = get_lead(phone_number)
 
         return {
             "status": "success",
-            "message": "Document processed and recorded in database.",
+            "message": "Document processed, stored, and recorded in database.",
+            "document_id": document_id,
             "extracted_text_snippet": extracted_text[:200],
             "parsed_expiry_date": expiry_date,
             "database_record": updated_lead,
@@ -298,46 +345,20 @@ async def test_document_upload(
 @app.get("/admin/knowledge-base", dependencies=[Depends(require_admin_key)])
 def get_all_kb_items():
     """Retrieve all knowledge base items for staff review."""
-    with closing(get_db_connection()) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, category, topic, content, is_active, updated_at FROM knowledge_base"
-        )
-        items = [
-            {
-                "id": row["id"],
-                "category": row["category"],
-                "topic": row["topic"],
-                "content": row["content"],
-                "is_active": bool(row["is_active"]),
-                "updated_at": row["updated_at"],
-            }
-            for row in cursor.fetchall()
-        ]
-    return {"status": "success", "data": items}
+    return {"status": "success", "data": db_list_kb_items()}
 
 
 @app.post("/admin/knowledge-base", dependencies=[Depends(require_admin_key)])
 def add_kb_item(item: KBItem):
     """Staff endpoint to add a new knowledge base entry."""
-    with closing(get_db_connection()) as conn:
-        with conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO knowledge_base (category, topic, content, is_active) VALUES (?, ?, ?, ?)",
-                (item.category, item.topic, item.content, 1 if item.is_active else 0),
-            )
-            item_id = cursor.lastrowid
+    item_id = db_add_kb_item(item.category, item.topic, item.content, item.is_active)
     return {"status": "success", "message": "Knowledge base item added", "id": item_id}
 
 
 @app.delete("/admin/knowledge-base/{item_id}", dependencies=[Depends(require_admin_key)])
 def delete_kb_item(item_id: int):
     """Staff endpoint to remove or deactivate a knowledge base entry."""
-    with closing(get_db_connection()) as conn:
-        with conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM knowledge_base WHERE id = ?", (item_id,))
+    db_delete_kb_item(item_id)
     return {"status": "success", "message": f"Item {item_id} deleted"}
 
 
@@ -412,6 +433,47 @@ def get_settings():
 def update_setting(item: AppSettingItem):
     set_app_setting(item.key, item.value)
     return {"status": "success", "message": f"{item.key} updated"}
+
+
+# ==========================================
+# ADMIN DOCUMENT REVIEW QUEUE (FR-8 storage, FR-14 review + audit trail)
+# ==========================================
+@app.get("/admin/documents", dependencies=[Depends(require_admin_key)])
+def get_pending_documents():
+    """The staff review queue - every upload starts PENDING here."""
+    return {"status": "success", "data": list_pending_documents()}
+
+
+@app.get("/admin/leads/{identifier}/documents", dependencies=[Depends(require_admin_key)])
+def get_documents_for_lead(identifier: str):
+    return {"status": "success", "data": list_documents_for_lead(identifier)}
+
+
+@app.get("/admin/documents/{document_id}/url", dependencies=[Depends(require_admin_key)])
+def get_document_url(document_id: int, accessed_by: str = "admin"):
+    """Issues a short-lived signed URL to the document's actual file in S3
+    - the ONLY way this app ever hands out access to a stored document, per
+    the SRS's private-storage requirement. Every issuance is logged
+    (log_document_access) as the audit trail for "who looked at this
+    client's document, and when"."""
+    document = get_document(document_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    url = document_store.get_signed_url(document["storage_key"])
+    log_document_access(document_id, accessed_by)
+    return {"status": "success", "url": url, "expires_in_seconds": document_store.SIGNED_URL_TTL_SECONDS}
+
+
+@app.post("/admin/documents/{document_id}/review", dependencies=[Depends(require_admin_key)])
+def submit_document_review(document_id: int, item: DocumentReviewItem):
+    """Staff approve/reject a pending document - the decision, who made
+    it, and when are all recorded (FR-14's audit trail)."""
+    if item.status not in ("APPROVED", "REJECTED"):
+        raise HTTPException(status_code=400, detail="status must be APPROVED or REJECTED")
+    if not get_document(document_id):
+        raise HTTPException(status_code=404, detail="Document not found")
+    review_document(document_id, item.status, item.reviewed_by, item.review_note)
+    return {"status": "success", "message": f"Document {document_id} marked {item.status}"}
 
 
 def _build_booking_slot() -> tuple[str, str]:
@@ -583,8 +645,8 @@ def _process_whatsapp_message(
         return
 
     if media_id:
-        extracted_text = extract_text_from_attachment(
-            media_id=media_id, media_content_type=media_content_type
+        extracted_text, content, content_type = extract_text_from_attachment(
+            media_id=media_id, media_content_type=media_content_type, with_bytes=True
         )
 
         if extracted_text:
@@ -595,6 +657,26 @@ def _process_whatsapp_message(
             # document we couldn't read a date from was recorded as if
             # compliance had actually been confirmed.
             doc_status = "VERIFIED" if expiry_date else "FAILED"
+
+            # Store the original file privately in S3 (FR-8) and queue it
+            # for staff review (FR-14) - previously the bytes were
+            # discarded the moment OCR finished.
+            storage_key = document_store.upload_document(
+                tenant_id=database.DEFAULT_TENANT_ID,
+                lead_phone_number=phone_number,
+                filename=f"whatsapp_{media_id}",
+                content=content,
+                content_type=content_type,
+            )
+            create_document(
+                lead_phone_number=phone_number,
+                storage_key=storage_key,
+                original_filename=f"whatsapp_{media_id}",
+                content_type=content_type,
+                size_bytes=len(content),
+                extracted_expiry_date=expiry_date,
+                status="PENDING" if expiry_date else "FAILED",
+            )
 
             save_or_update_lead(
                 phone_number=phone_number,
@@ -677,14 +759,17 @@ def _process_whatsapp_message(
 
 # 2. POST request for Meta's Incoming Messages
 @app.post("/whatsapp/webhook")
-async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
+async def whatsapp_webhook(request: Request):
     """Handles incoming real-time messages from Meta.
 
     Verifies the request actually came from Meta, extracts just enough to
     dedupe and queue the real work, and returns immediately - the AI/OCR/
-    send pipeline runs as a background task so Meta gets its ack well
-    inside the ~1s target instead of waiting on a synchronous LLM+OCR round
-    trip.
+    send pipeline runs as a durable Redis-backed job (see worker.py), not
+    inline, so Meta gets its ack well inside the ~1s target instead of
+    waiting on a synchronous LLM+OCR round trip, AND the message survives
+    an app-process restart between being acked and actually being handled
+    (a FastAPI BackgroundTask, the previous mechanism, does not - it's
+    lost if the process dies before it runs).
     """
     raw_body = await request.body()
     signature = request.headers.get("x-hub-signature-256")
@@ -728,8 +813,8 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
     if _rate_limited(phone_number):
         return {"status": "rate_limited", "reason": "Too many messages, please slow down"}
 
-    background_tasks.add_task(
-        _process_whatsapp_message, phone_number, msg_type, message, external_id
+    await request.app.state.redis_pool.enqueue_job(
+        "process_whatsapp_message_job", phone_number, msg_type, message, external_id
     )
     return {"status": "queued"}
 

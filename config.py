@@ -50,5 +50,11 @@ class Settings:
     # routes refuse every request until this is actually configured.
     ADMIN_API_KEY: str = os.getenv("ADMIN_API_KEY", "")
 
+    # Durable job queue (see worker.py) - inbound WhatsApp messages are
+    # enqueued here rather than processed inline, so a message survives an
+    # app-process restart between being acked to Meta and actually being
+    # handled (SRS NFR: "No inbound message lost: durable queue with retries").
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://127.0.0.1:6379")
+
 
 settings = Settings()

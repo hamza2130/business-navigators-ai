@@ -6,13 +6,13 @@ An intelligent, multi-service backend powered by **FastAPI** that integrates wit
 
 ## Key Features
 
-- **WhatsApp Cloud API Integration:** Signed webhook receiver handling text messages, media files, dynamic routing, and instant automated replies, processed in the background so Meta's delivery is acknowledged immediately.
-- **AI Service Integration:** Conversational context kept across a thread and passed to Groq LLM inference on every reply.
-- **Document Parsing & OCR:** Automated text extraction from uploaded images and documents (PDF, Word, Excel), with expiry-date extraction that looks for the actual "expiry" label rather than just the first date on the page.
+- **WhatsApp Cloud API Integration:** Signed webhook receiver handling text messages, media files, and dynamic routing. Inbound messages are enqueued to Redis and handled by a separate `worker.py` process, so Meta's delivery is acknowledged immediately and a message survives an app restart instead of being lost.
+- **AI Service Integration:** Conversational context kept across a thread and passed to Groq LLM inference on every reply, which also extracts structured lead-qualification fields (name, industry, VAT status, service interest) from natural conversation.
+- **Document Parsing, OCR & Storage:** Automated text extraction from uploaded images and documents (PDF, Word, Excel), with expiry-date extraction that looks for the actual "expiry" label rather than just the first date on the page. The original file is stored privately in S3-compatible object storage, accessible only via short-lived signed URLs, and queued for staff review.
 - **Calendar & Email Automation:** Google Calendar booking (Asia/Dubai) and automated transactional/notification email delivery via Brevo.
 - **Compliance Reminders:** A daily scheduled job tracks document expiry and sends WhatsApp reminders 30 and 7 days out, resilient to a missed run.
-- **SQLite Database Persistence:** Local storage for lead records, conversation history, and the knowledge base.
-- **Admin Dashboard:** Key-protected staff UI for managing the knowledge base and pausing AI replies per lead.
+- **Multi-Tenant PostgreSQL:** Every table enforces tenant isolation via Row-Level Security at the database layer, not just application code - a second tenant can be added with zero schema changes.
+- **Admin Dashboard:** Key-protected staff UI for managing the knowledge base, scoring rules, lead list, and pausing AI replies per lead.
 
 ---
 
@@ -21,9 +21,14 @@ An intelligent, multi-service backend powered by **FastAPI** that integrates wit
 ```
 BusinessNavigatorsAI/
 ├── main.py                # FastAPI entrypoint, webhook routes, admin routes, auth
+├── worker.py               # arq worker process - consumes queued WhatsApp messages
+├── queue_utils.py           # Redis settings shared by main.py and worker.py
 ├── config.py               # Environment configuration loader
-├── database.py              # SQLite connections, schema migrations, lead/message models
-├── ai_service.py            # Groq API integration for conversational AI
+├── database.py              # PostgreSQL connection pool, RLS-aware queries
+├── schema.sql               # Table definitions, RLS policies, app_user role
+├── scoring_service.py       # Lead scoring/tiering against admin-configurable rules
+├── document_store.py        # S3-compatible document storage (upload, signed URLs)
+├── ai_service.py            # Groq API integration for conversational AI + FR-3 extraction
 ├── whatsapp_service.py      # Meta Graph API message + template dispatch
 ├── ocr_service.py           # OCR + expiry-date extraction
 ├── document_parser.py       # Document text extraction logic (PDF/Word/Excel/images)
@@ -33,6 +38,7 @@ BusinessNavigatorsAI/
 ├── kb_service.py             # Knowledge base query processor
 ├── static/                  # Admin dashboard (key-protected)
 ├── requirements.txt         # Project dependencies
+├── docker-compose.yml        # Full local stack: postgres, redis, minio, api, worker
 ├── .env.example              # Every environment variable this app reads, documented
 └── .gitignore                # Excluded secrets, credentials, local databases
 ```
@@ -43,92 +49,86 @@ BusinessNavigatorsAI/
 
 - **Framework:** [FastAPI](https://fastapi.tiangolo.com/) (Python 3.10+)
 - **Server:** Uvicorn
+- **Database:** PostgreSQL with Row-Level Security (multi-tenant from day one)
+- **Queue:** Redis + [arq](https://arq-docs.helpmanual.io/) (durable job queue - see `worker.py`)
+- **Object storage:** Any S3-compatible endpoint (real AWS S3 in production; MinIO or moto locally)
 - **AI Engine:** Groq API (LLaMA inference models)
 - **Messaging:** Meta WhatsApp Cloud API (Graph API v20.0+)
 - **Tunneling:** ngrok (for local webhook deployment)
-- **Database:** SQLite
 
 ---
 
 ## Quickstart Guide
 
-### 1. Prerequisites
-- Python 3.10+ installed
+The stack now has four moving parts - PostgreSQL, Redis, S3-compatible
+storage, and **two** application processes (`api` and `worker`) - so
+**Docker is the recommended path**. A fully-native setup is documented
+below it for local development without Docker.
+
+### Prerequisites (either path)
 - Meta Developer Account with WhatsApp Cloud API enabled
-- ngrok installed on your machine
-- **Tesseract OCR** and **Poppler** installed and on PATH (`pdf2image`/`pytesseract` are Python wrappers around these system binaries - they are not installed by `pip`)
+- ngrok installed on your machine (to expose your local server to Meta's webhook)
+- Groq / Brevo API keys
 
-### 2. Installation
-
-Clone the repository and enter the project folder:
+### Option A: Docker (recommended)
 
 ```bash
 git clone https://github.com/hamza2130/business-navigators-ai.git
 cd business-navigators-ai
+cp .env.example .env   # fill in Groq/Meta/Brevo/admin keys - see .env.example
+docker compose up --build
 ```
 
-Set up a virtual environment:
+This starts the full stack: `postgres` (with `schema.sql` applied
+automatically on first startup - every table, RLS policy, and the
+`app_user` role), `redis` (the job queue), `minio` (local S3-compatible
+document storage - point `S3_ENDPOINT_URL` at nothing and set real AWS
+credentials to use real S3 in production instead), `api` (FastAPI on
+`http://localhost:8000`), and `worker` (the arq process that actually
+handles queued WhatsApp messages - **nothing gets processed without it
+running**). Scale workers independently for load:
+`docker compose up --scale worker=3`.
 
-```bash
-# On Windows
-python -m venv venv
-.\venv\Scripts\Activate.ps1
+**Not yet verified against a real Docker daemon** - written and reviewed
+for correctness (images, health checks, service dependencies, environment
+wiring), but this environment didn't have Docker available to actually
+build and run it. Each underlying piece (schema.sql, the S3 code, the
+Redis queue) was verified for real against portable non-Docker installs
+of Postgres/Redis/moto - see the commit history - but the Compose file
+itself is unverified. Treat it as a strong starting point until someone
+runs `docker compose up --build` for real.
 
-# On macOS/Linux
-python3 -m venv venv
-source venv/bin/activate
-```
+### Option B: Native (no Docker)
 
-Install the dependencies:
+1. **Install and start PostgreSQL, Redis, and an S3-compatible endpoint**
+   (real MinIO, or `pip install "moto[server]" && python -m moto.server -p 9000`
+   for a lightweight stand-in), then apply the schema:
+   ```bash
+   createdb business_navigators
+   psql -d business_navigators -f schema.sql
+   ```
+2. **Install Tesseract OCR and Poppler** and put them on PATH
+   (`pytesseract`/`pdf2image` are Python wrappers around these system
+   binaries - `pip` does not install them).
+3. **Set up the app:**
+   ```bash
+   python -m venv venv && source venv/bin/activate   # .\venv\Scripts\Activate.ps1 on Windows
+   pip install -r requirements.txt
+   cp .env.example .env   # fill in DATABASE_URL/REDIS_URL/S3_* plus Groq/Meta/Brevo/admin keys
+   ```
+4. **Run both processes** (in separate terminals - the app enqueues messages, the worker is what actually handles them):
+   ```bash
+   uvicorn main:app --reload
+   arq worker.WorkerSettings
+   ```
 
-```bash
-pip install -r requirements.txt
-```
+### Connecting to Meta (either path)
 
-### 3. Environment Setup
-
-Copy `.env.example` to `.env` and fill in real values - every variable the app reads is documented there, including which ones are required (the app refuses requests rather than silently running unauthenticated if these are left blank):
-
-```bash
-cp .env.example .env
-```
-
-At minimum you'll need:
-
-```env
-GROQ_API_KEY=your_groq_api_key
-
-WHATSAPP_TOKEN=your_meta_permanent_or_temporary_access_token
-WHATSAPP_PHONE_NUMBER_ID=your_whatsapp_phone_number_id
-META_VERIFY_TOKEN=choose_a_long_random_string
-META_APP_SECRET=your_meta_app_secret          # required - verifies inbound webhooks are really from Meta
-
-BREVO_API_KEY=your_brevo_api_key
-SENDER_EMAIL=your_email@domain.com
-EMAIL_WEBHOOK_SECRET=choose_a_long_random_string   # required - verifies inbound email webhook calls
-
-ADMIN_API_KEY=choose_a_long_random_string      # required - gates every /admin/* route and the dashboard
-
-BOOKING_LINK=https://calendar.app.google/...
-```
-
-See `.env.example` for the full list, including optional WhatsApp Message Template names for the expiry-reminder job.
-
-### 4. Running the Server & Webhook
-
-Start the FastAPI application:
-
-```bash
-uvicorn main:app --reload
-```
-
-Expose your local server via ngrok (in a separate terminal):
+Expose your local server via ngrok:
 
 ```bash
 ngrok http 8000
 ```
-
-Configure Meta Webhook:
 
 In Meta Developer Console under **WhatsApp > Configuration**:
 
@@ -138,27 +138,7 @@ In Meta Developer Console under **WhatsApp > Configuration**:
 
 The email webhook lives at `https://your-ngrok-url.ngrok-free.app/webhook/email` - configure it as Brevo's inbound-parse destination, with `EMAIL_WEBHOOK_SECRET` set as a custom header or `?secret=` query param on that URL.
 
-### Alternative: Docker
-
-```bash
-cp .env.example .env   # fill in real values first
-docker compose up --build
-```
-
-This builds the image (Python 3.11 + Tesseract OCR + Poppler, the two
-system binaries `pytesseract`/`pdf2image` depend on but don't install
-themselves) and runs it on `http://localhost:8000`, with the SQLite
-database persisted to `./data/leads.db` so it survives a rebuild. Set
-`DB_NAME` yourself if you're running outside Docker and want the same
-override.
-
-**Not yet verified against a real Docker daemon** - it was written and
-reviewed for correctness (base image, system packages, healthcheck) but
-this environment didn't have Docker available to actually build and run
-it. Treat it as a strong starting point, not a confirmed-working image,
-until someone runs `docker compose up --build` for real.
-
-### 5. Admin Dashboard
+### Admin Dashboard
 
 Open `https://your-host/dashboard/?key=<your ADMIN_API_KEY>`. The key is required - the dashboard and every `/admin/*` API route return `401` without it.
 
@@ -166,10 +146,12 @@ Open `https://your-host/dashboard/?key=<your ADMIN_API_KEY>`. The key is require
 
 ## Security & Privacy Note
 
-- Secret keys, `.env` files, `credentials.json` (Google service account), and local SQLite databases are excluded from version control via `.gitignore`.
+- Secret keys and `.env` files (including `credentials.json`, the Google service account key) are excluded from version control via `.gitignore`.
+- Tenant isolation is enforced by PostgreSQL Row-Level Security, not just application-level filtering - every table's policies fail closed (zero rows visible) if a connection's tenant context is ever unset, rather than exposing all tenants' data.
+- Documents are stored privately in S3-compatible storage and are only ever accessible via short-lived signed URLs; every URL issuance is logged (`document_access_log`) as an audit trail.
 - Every inbound webhook is authenticated (Meta's `X-Hub-Signature-256` for WhatsApp, a shared secret for the email webhook) - requests that don't verify are rejected, not silently accepted.
 - Every `/admin/*` route and the dashboard require `ADMIN_API_KEY`; there is no unauthenticated fallback.
-- Ensure all API keys are kept secure in deployment environments, and rotate `ADMIN_API_KEY` / `META_APP_SECRET` / `EMAIL_WEBHOOK_SECRET` if they are ever exposed.
+- Ensure all API keys are kept secure in deployment environments, and rotate `ADMIN_API_KEY` / `META_APP_SECRET` / `EMAIL_WEBHOOK_SECRET` / the `app_user` Postgres password if they are ever exposed.
 
 ---
 

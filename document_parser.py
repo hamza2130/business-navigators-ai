@@ -124,32 +124,43 @@ def extract_text_from_attachment(
     media_id: str = None,
     media_content_type: str = "",
     file_path: str = None,
-    auth=None
-) -> str:
-    """Unified entry point: accepts local file paths or Meta WhatsApp media_ids."""
+    auth=None,
+    with_bytes: bool = False,
+):
+    """Unified entry point: accepts local file paths or Meta WhatsApp media_ids.
+
+    Returns just the extracted text (str) by default - unchanged from
+    before. Pass with_bytes=True to also get the raw file bytes and
+    resolved content type back, as (text, content, content_type), needed
+    by callers that persist the original file to S3 (FR-8) alongside
+    extracting its text.
+    """
+    empty = ("", b"", "") if with_bytes else ""
     try:
         # Local File Upload (from /admin/test-document-upload)
         if file_path:
             if not os.path.exists(file_path):
                 print(f"[ERROR] File not found: {file_path}")
-                return ""
+                return empty
 
             with open(file_path, "rb") as f:
                 content = f.read()
 
-            file_ext = os.path.splitext(file_path)[1].lower()
-            return _parse_bytes_content(content, content_type=file_ext)
+            content_type = os.path.splitext(file_path)[1].lower()
+            text = _parse_bytes_content(content, content_type=content_type)
+            return (text, content, content_type) if with_bytes else text
 
         # Meta WhatsApp Media via Graph API
         elif media_id:
             content, resolved_mime = _download_meta_media(media_id)
             if not content:
-                return ""
+                return empty
 
-            target_mime = media_content_type or resolved_mime
-            return _parse_bytes_content(content, content_type=target_mime)
+            content_type = media_content_type or resolved_mime
+            text = _parse_bytes_content(content, content_type=content_type)
+            return (text, content, content_type) if with_bytes else text
 
     except Exception as e:
         print(f"Document Parsing Exception: {e}")
 
-    return ""
+    return empty

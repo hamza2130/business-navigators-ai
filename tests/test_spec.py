@@ -9,14 +9,13 @@ assistant.
 
 Run:  testenv/Scripts/python.exe -m pytest tests/ -v
 """
-import asyncio
 import datetime
 import pathlib
-import sqlite3
 import subprocess
 import sys
 import time
 
+import psycopg
 import pytest
 
 from conftest import (
@@ -28,12 +27,16 @@ from conftest import (
     GROQ_SHOULD_FAIL,
     TEST_APP_SECRET,
     TEST_CALENDAR_ID,
+    TEST_DATABASE_URL,
+    TEST_SUPERUSER_URL,
     admin_headers,
+    calendar_events_for,
     groq_messages,
     meta_media_payload,
     meta_text_payload,
     post_email_webhook,
     post_whatsapp_webhook,
+    run_queued_jobs,
     sign_meta_payload,
     wa_payloads,
     wa_texts,
@@ -160,14 +163,16 @@ class TestConversation:
         post_whatsapp_webhook(client, meta_text_payload("971500000003", "can we book a meeting"))
         import database
         assert database.get_lead("971500000003")["state"] == "MEETING_REQUESTED"
-        assert len(OUT["calendar"]) == 1, "no calendar event created"
+        assert len(calendar_events_for("971500000003")) == 1, "no calendar event created"
 
     def test_booked_meeting_is_10am_dubai_wall_clock(self, client):
         """The event's dateTime is a naive Asia/Dubai local string paired
         with timeZone='Asia/Dubai' - Google reads the two together, so this
         checks the literal wall-clock hour, not a UTC-converted one."""
         post_whatsapp_webhook(client, meta_text_payload("971500000004", "schedule a call please"))
-        start = OUT["calendar"][0]["body"]["start"]
+        events = calendar_events_for("971500000004")
+        assert len(events) == 1
+        start = events[0]["body"]["start"]
         assert start["timeZone"] == "Asia/Dubai"
         hour = int(start["dateTime"].split("T")[1].split(":")[0])
         assert hour == 10, f"meeting lands at {hour}:00, not 10:00"
@@ -176,7 +181,9 @@ class TestConversation:
         """Must NOT silently default to 'primary' (the service account's own,
         invisible-to-humans calendar) once a real calendar is configured."""
         post_whatsapp_webhook(client, meta_text_payload("971500000006", "book appointment"))
-        assert OUT["calendar"][0]["calendarId"] == TEST_CALENDAR_ID
+        events = calendar_events_for("971500000006")
+        assert len(events) == 1
+        assert events[0]["calendarId"] == TEST_CALENDAR_ID
 
     def test_booking_invites_the_lead_when_email_is_known(self, client):
         """The email channel's identifier IS an email address, so it can be
@@ -184,8 +191,9 @@ class TestConversation:
         post_email_webhook(client, {
             "sender": {"email": "lead@example.com"}, "subject": "Booking",
             "text": "I'd like to book a consultation call"})
-        assert OUT["calendar"], "no event created for email-channel booking"
-        attendees = OUT["calendar"][0]["body"].get("attendees", [])
+        events = calendar_events_for("lead@example.com")
+        assert len(events) == 1, "no event created for email-channel booking"
+        attendees = events[0]["body"].get("attendees", [])
         assert any(a.get("email") == "lead@example.com" for a in attendees)
 
     def test_whatsapp_booking_has_no_attendee_yet(self, client):
@@ -195,7 +203,9 @@ class TestConversation:
         this channel. This test documents the current, intentional
         limitation rather than silently letting it regress further."""
         post_whatsapp_webhook(client, meta_text_payload("971500000005", "book appointment"))
-        assert "attendees" not in OUT["calendar"][0]["body"]
+        events = calendar_events_for("971500000005")
+        assert len(events) == 1
+        assert "attendees" not in events[0]["body"]
 
     def test_human_takeover_suppresses_ai(self, client):
         import database
@@ -393,6 +403,119 @@ class TestAdminSecurity:
 
 
 # ==========================================================================
+# E2. DOCUMENT STORAGE & REVIEW QUEUE (FR-8, FR-14)
+# ==========================================================================
+class TestDocumentStorage:
+    def _upload(self, client, phone="971500000060"):
+        import io
+        return client.post(
+            "/admin/test-document-upload",
+            headers=admin_headers(),
+            data={"phone_number": phone},
+            files={"file": ("passport.png", io.BytesIO(b"fake image bytes"), "image/png")},
+        )
+
+    def test_upload_stores_the_original_file_in_s3(self, client):
+        """The bytes must actually be stored, not discarded after OCR -
+        this was the FR-8 gap: previously nothing survived past text
+        extraction."""
+        OCR_TEXT["value"] = "Date of Expiry: 01/01/2031"
+        r = self._upload(client)
+        assert r.status_code == 200
+        doc_id = r.json()["document_id"]
+
+        import database
+        doc = database.get_document(doc_id)
+        assert doc is not None
+        assert doc["storage_key"]
+
+        # Prove it, don't just trust the row: fetch the object straight
+        # out of S3 and check the bytes round-tripped.
+        import document_store
+        url = document_store.get_signed_url(doc["storage_key"])
+        import requests
+        resp = requests.get(url)
+        assert resp.status_code == 200
+        assert resp.content == b"fake image bytes"
+
+    def test_uploaded_document_appears_in_review_queue(self, client):
+        OCR_TEXT["value"] = "Date of Expiry: 01/01/2031"
+        r = self._upload(client)
+        doc_id = r.json()["document_id"]
+        queue = client.get("/admin/documents", headers=admin_headers()).json()["data"]
+        assert any(d["id"] == doc_id and d["status"] == "PENDING" for d in queue)
+
+    def test_document_with_no_readable_expiry_is_not_verified(self, client):
+        OCR_TEXT["value"] = "blurry scan, no dates"
+        r = self._upload(client)
+        doc_id = r.json()["document_id"]
+        import database
+        assert database.get_document(doc_id)["status"] == "FAILED"
+
+    def test_signed_url_access_is_logged(self, client):
+        OCR_TEXT["value"] = "Date of Expiry: 01/01/2031"
+        r = self._upload(client)
+        doc_id = r.json()["document_id"]
+
+        r2 = client.get(f"/admin/documents/{doc_id}/url?accessed_by=reviewer_x", headers=admin_headers())
+        assert r2.status_code == 200
+        assert "url" in r2.json()
+
+        import database
+        with database.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT accessed_by FROM document_access_log WHERE document_id = %s", (doc_id,)
+            ).fetchall()
+        assert any(row["accessed_by"] == "reviewer_x" for row in rows), (
+            "signed URL was issued but no access log entry was recorded")
+
+    def test_review_approves_and_leaves_the_queue(self, client):
+        OCR_TEXT["value"] = "Date of Expiry: 01/01/2031"
+        r = self._upload(client)
+        doc_id = r.json()["document_id"]
+
+        r2 = client.post(
+            f"/admin/documents/{doc_id}/review", headers=admin_headers(),
+            json={"status": "APPROVED", "reviewed_by": "staff_a", "review_note": "clear scan"},
+        )
+        assert r2.status_code == 200
+
+        import database
+        doc = database.get_document(doc_id)
+        assert doc["status"] == "APPROVED"
+        assert doc["reviewed_by"] == "staff_a"
+
+        queue = client.get("/admin/documents", headers=admin_headers()).json()["data"]
+        assert not any(d["id"] == doc_id for d in queue), "approved document is still in the pending queue"
+
+    def test_review_rejects_invalid_status(self, client):
+        OCR_TEXT["value"] = "Date of Expiry: 01/01/2031"
+        r = self._upload(client)
+        doc_id = r.json()["document_id"]
+        r2 = client.post(
+            f"/admin/documents/{doc_id}/review", headers=admin_headers(),
+            json={"status": "MAYBE", "reviewed_by": "staff_a"},
+        )
+        assert r2.status_code == 400
+
+    def test_documents_endpoints_require_auth(self, client):
+        assert client.get("/admin/documents").status_code == 401
+        assert client.get("/admin/documents/1/url").status_code == 401
+        assert client.post("/admin/documents/1/review", json={"status": "APPROVED", "reviewed_by": "x"}).status_code == 401
+        assert client.get("/admin/leads/971500000060/documents").status_code == 401
+
+    def test_whatsapp_media_upload_also_stores_to_s3(self, client):
+        """The WhatsApp path previously discarded the bytes entirely after
+        OCR - it must now store them the same way the admin upload does."""
+        OCR_TEXT["value"] = "Date of Expiry: 01/01/2031"
+        post_whatsapp_webhook(client, meta_media_payload("971500000061"))
+        import database
+        docs = database.list_documents_for_lead("971500000061")
+        assert len(docs) == 1
+        assert docs[0]["storage_key"]
+
+
+# ==========================================================================
 # F. EMAIL CHANNEL
 # ==========================================================================
 class TestEmail:
@@ -483,6 +606,64 @@ class TestScheduler:
 # ==========================================================================
 # H. DATA LAYER
 # ==========================================================================
+class TestMultiTenancy:
+    """Proves Row-Level Security actually isolates tenants at the database
+    layer (SRS NFR), not just that the app happens to filter by tenant_id
+    in its own queries. Exercised through database.py's real connection
+    pool against the real Postgres test database - manually verified once
+    with raw psql as app_user during development; this is that same proof
+    captured as a regression test."""
+
+    def test_leads_are_isolated_between_tenants(self, app_env):
+        import database
+
+        with psycopg.connect(TEST_SUPERUSER_URL, autocommit=True) as conn:
+            conn.execute("INSERT INTO tenants (id, name) VALUES ('other_co', 'Other Co') ON CONFLICT DO NOTHING")
+
+        try:
+            database.save_or_update_lead("971500099001", name="Default Tenant Lead", state="NEW")
+
+            with database.get_conn(tenant_id="other_co") as conn:
+                conn.execute(
+                    "INSERT INTO leads (tenant_id, phone_number, name) VALUES ('other_co', %s, %s)",
+                    ("971500099002", "Other Tenant Lead"),
+                )
+
+            # As the 'default' tenant (this app's normal operating mode):
+            # the other tenant's lead must be completely invisible.
+            assert database.get_lead("971500099001") is not None
+            assert database.get_lead("971500099002") is None, (
+                "a lead belonging to a different tenant was visible - RLS is not isolating tenants"
+            )
+            identifiers = [l["identifier"] for l in database.list_leads()]
+            assert "971500099002" not in identifiers
+
+            # As the other tenant: the reverse must also hold.
+            with database.get_conn(tenant_id="other_co") as conn:
+                row = conn.execute(
+                    "SELECT phone_number FROM leads WHERE phone_number = %s", ("971500099001",)
+                ).fetchone()
+                assert row is None, "default tenant's lead was visible to a different tenant"
+                row = conn.execute(
+                    "SELECT phone_number FROM leads WHERE phone_number = %s", ("971500099002",)
+                ).fetchone()
+                assert row is not None
+        finally:
+            with psycopg.connect(TEST_SUPERUSER_URL, autocommit=True) as conn:
+                conn.execute("DELETE FROM leads WHERE tenant_id = 'other_co'")
+                conn.execute("DELETE FROM tenants WHERE id = 'other_co'")
+
+    def test_missing_tenant_context_sees_nothing(self, app_env):
+        """A connection that never sets app.tenant_id must fail CLOSED
+        (zero visible rows), never open (all tenants' data)."""
+        import database
+
+        database.save_or_update_lead("971500099003", name="Someone", state="NEW")
+        with psycopg.connect(TEST_DATABASE_URL) as conn:
+            rows = conn.execute("SELECT * FROM leads").fetchall()
+            assert rows == [], "rows were visible with no tenant context set - RLS default is not fail-closed"
+
+
 class TestDatabase:
     def test_upsert_preserves_unrelated_fields(self, app_env):
         import database
@@ -510,57 +691,32 @@ class TestDatabase:
         database.update_lead_state_and_score("971500000031b", "ENGAGED", 5)
         assert database.get_lead("971500000031b")["score"] == 15
 
-    def test_connections_are_closed(self, app_env, monkeypatch):
+    def test_connections_are_released_back_to_the_pool(self, app_env):
+        """Every database.py call borrows a pooled connection via
+        get_conn() and must return it - if one leaked, pool_available
+        would stay below pool_size after the call, and repeated calls
+        would eventually exhaust the pool and hang/timeout."""
         import database
-        opened = []
-        real = sqlite3.connect
 
-        def tracking(*a, **k):
-            c = real(*a, **k)
-            opened.append(c)
-            return c
+        database.get_lead("971500000032")  # touch the pool once, ensure it's open
+        stats = database._pool.get_stats()
+        assert stats["pool_available"] == stats["pool_size"], (
+            f"{stats['pool_size'] - stats['pool_available']} connection(s) still "
+            f"checked out after the call returned"
+        )
 
-        monkeypatch.setattr(database.sqlite3, "connect", tracking)
-        database.get_lead("971500000032")
-        leaked = []
-        for c in opened:
-            try:
-                c.execute("SELECT 1")
-                leaked.append(c)
-            except sqlite3.ProgrammingError:
-                pass
-        assert not leaked, f"{len(leaked)}/{len(opened)} connection(s) left open per call"
+        # 3x the pool's max_size - would hang on a real leak instead of
+        # completing, since get_conn() would eventually find no free
+        # connection and no way to open a new one.
+        for i in range(30):
+            database.get_lead(f"971500000032-{i}")
+        stats = database._pool.get_stats()
+        assert stats["pool_available"] == stats["pool_size"]
 
 
 # ==========================================================================
 # I. PERFORMANCE / RESILIENCE
 # ==========================================================================
-def _make_synthetic_request(body: bytes, signature: str):
-    """A minimal ASGI Request, built without going through TestClient - used
-    only to verify the webhook handler itself returns before doing any
-    work. TestClient can't show this: Starlette runs a background task
-    synchronously, before client.post() returns, which would make the
-    handler look slow even when it isn't."""
-    from starlette.requests import Request as StarletteRequest
-
-    scope = {
-        "type": "http", "method": "POST", "path": "/whatsapp/webhook",
-        "raw_path": b"/whatsapp/webhook", "query_string": b"",
-        "headers": [
-            (b"x-hub-signature-256", signature.encode()),
-            (b"content-type", b"application/json"),
-        ],
-        "client": ("test", 123), "server": ("test", 80),
-    }
-    sent = {"done": False}
-
-    async def receive():
-        if not sent["done"]:
-            sent["done"] = True
-            return {"type": "http.request", "body": body, "more_body": False}
-        return {"type": "http.disconnect"}
-
-    return StarletteRequest(scope, receive)
 
 
 # ==========================================================================
@@ -662,31 +818,29 @@ class TestLeadQualification:
 
 class TestResilience:
     def test_webhook_handler_returns_before_doing_any_work(self, client):
-        """The handler function itself must return {'status': 'queued'}
-        without running OCR/AI inline - verified by invoking it directly
-        with a BackgroundTasks we control (see _make_synthetic_request)."""
-        import main
-        from fastapi import BackgroundTasks
-
+        """The handler must respond {'status': 'queued'} without running
+        OCR/AI inline - it enqueues to real Redis and returns; nothing
+        drains the queue until run_queued_jobs() (or a real worker) does,
+        so this is now directly observable through the normal client
+        instead of needing a hand-built ASGI Request."""
         OCR_TEXT["value"] = PASSPORT_OCR
         OCR_DELAY["seconds"] = 1.0
-        payload = meta_media_payload("971500000040")
-        raw, sig = sign_meta_payload(payload)
-        request = _make_synthetic_request(raw, sig)
-        bg = BackgroundTasks()
-
         try:
             t0 = time.perf_counter()
-            result = asyncio.run(main.whatsapp_webhook(request, bg))
+            r = post_whatsapp_webhook(client, meta_media_payload("971500000040"), run_jobs=False)
             elapsed = time.perf_counter() - t0
+
+            assert r.status_code == 200 and r.json() == {"status": "queued"}
+            assert elapsed < 1.0, f"handler itself took {elapsed:.2f}s before returning"
+            assert OUT["groq"] == [] and OUT["whatsapp"] == [], (
+                "handler did the work synchronously instead of deferring to the queue")
+
+            # Now actually drain it and confirm the job runs correctly -
+            # proves the enqueue was real, not just a fast no-op.
+            run_queued_jobs()
+            assert OUT["whatsapp"], "job was enqueued but never actually processed by the worker"
         finally:
             OCR_DELAY["seconds"] = 0.0
-
-        assert result == {"status": "queued"}
-        assert elapsed < 0.3, f"handler itself took {elapsed:.2f}s before returning"
-        assert OUT["groq"] == [] and OUT["whatsapp"] == [], (
-            "handler did the work synchronously instead of deferring to the background task")
-        assert len(bg.tasks) == 1, "no background task was queued"
 
     def test_llm_failure_is_not_sent_to_the_client_as_a_normal_reply(self, client):
         GROQ_SHOULD_FAIL["value"] = True
