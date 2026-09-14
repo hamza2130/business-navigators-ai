@@ -24,16 +24,13 @@ COPY . .
 
 # Run as a non-root user
 RUN useradd --create-home --uid 1000 appuser \
-    && mkdir -p /app/data \
     && chown -R appuser:appuser /app
 USER appuser
 
-# SQLite database lives on a volume so it survives container recreation -
-# see docker-compose.yml. DB_NAME defaults to "leads.db" (relative to
-# WORKDIR) unless overridden; the compose file mounts ./data as /app/data
-# and the app is expected to be pointed there in production via a future
-# DB_NAME/DATABASE_URL setting (tracked separately - see the SRS gap
-# analysis's Phase 2 Postgres migration).
+# State lives in the other services (see docker-compose.yml), not in this
+# container: PostgreSQL (DATABASE_URL), Redis (REDIS_URL), S3/MinIO
+# (S3_ENDPOINT_URL). This image is stateless and fine to scale/replace
+# freely.
 
 EXPOSE 8000
 
