@@ -1,7 +1,12 @@
+import os
 import sqlite3
 from contextlib import closing
 
-DB_NAME = "leads.db"
+# Overridable so the SQLite file can live on a mounted volume in a
+# container (see Dockerfile/docker-compose.yml) instead of the working
+# directory, which would otherwise be lost whenever the container is
+# recreated.
+DB_NAME = os.getenv("DB_NAME", "leads.db")
 
 
 def get_db_connection() -> sqlite3.Connection:

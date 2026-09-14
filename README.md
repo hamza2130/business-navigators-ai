@@ -138,6 +138,26 @@ In Meta Developer Console under **WhatsApp > Configuration**:
 
 The email webhook lives at `https://your-ngrok-url.ngrok-free.app/webhook/email` - configure it as Brevo's inbound-parse destination, with `EMAIL_WEBHOOK_SECRET` set as a custom header or `?secret=` query param on that URL.
 
+### Alternative: Docker
+
+```bash
+cp .env.example .env   # fill in real values first
+docker compose up --build
+```
+
+This builds the image (Python 3.11 + Tesseract OCR + Poppler, the two
+system binaries `pytesseract`/`pdf2image` depend on but don't install
+themselves) and runs it on `http://localhost:8000`, with the SQLite
+database persisted to `./data/leads.db` so it survives a rebuild. Set
+`DB_NAME` yourself if you're running outside Docker and want the same
+override.
+
+**Not yet verified against a real Docker daemon** - it was written and
+reviewed for correctness (base image, system packages, healthcheck) but
+this environment didn't have Docker available to actually build and run
+it. Treat it as a strong starting point, not a confirmed-working image,
+until someone runs `docker compose up --build` for real.
+
 ### 5. Admin Dashboard
 
 Open `https://your-host/dashboard/?key=<your ADMIN_API_KEY>`. The key is required - the dashboard and every `/admin/*` API route return `401` without it.

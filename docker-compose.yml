@@ -1,0 +1,18 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # SQLite file lives on the ./data volume below, not the image layer,
+      # so it survives `docker compose down` / rebuilds.
+      DB_NAME: /app/data/leads.db
+    volumes:
+      - ./data:/app/data
+      # Optional: mount a real Google service-account key for calendar
+      # booking. Uncomment once you have one - see .env.example
+      # (GOOGLE_CREDENTIALS_FILE).
+      # - ./credentials.json:/app/credentials.json:ro
+    restart: unless-stopped
