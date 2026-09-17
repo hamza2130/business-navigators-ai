@@ -1,4 +1,3 @@
-from contextlib import closing
 from datetime import datetime, timedelta
 
 import database
@@ -43,22 +42,20 @@ def check_expiring_documents():
     cutoff_30d = (today + timedelta(days=30)).strftime("%Y-%m-%d")
     cutoff_7d = (today + timedelta(days=7)).strftime("%Y-%m-%d")
 
-    with closing(database.get_db_connection()) as conn:
-        cursor = conn.cursor()
-
+    with database.get_conn() as conn:
         # 1. 30-day reminders: expiry within 30 days, not yet sent for this
         #    expiry date.
-        cursor.execute(
+        due_30d = conn.execute(
             """
             SELECT phone_number, name, document_expiry_date
             FROM leads
             WHERE document_expiry_date IS NOT NULL
-              AND document_expiry_date <= ?
+              AND document_expiry_date <= %s
               AND reminder_30d_sent_at IS NULL
             """,
             (cutoff_30d,),
-        )
-        for lead in cursor.fetchall():
+        ).fetchall()
+        for lead in due_30d:
             phone = lead["phone_number"]
             name = lead["name"] or "Valued Client"
             expiry = lead["document_expiry_date"]
@@ -73,17 +70,17 @@ def check_expiring_documents():
             print(f"[REMINDER SENT] 30-day expiry notification sent to {phone}")
 
         # 2. 7-day urgent reminders: same pattern, tighter window.
-        cursor.execute(
+        due_7d = conn.execute(
             """
             SELECT phone_number, name, document_expiry_date
             FROM leads
             WHERE document_expiry_date IS NOT NULL
-              AND document_expiry_date <= ?
+              AND document_expiry_date <= %s
               AND reminder_7d_sent_at IS NULL
             """,
             (cutoff_7d,),
-        )
-        for lead in cursor.fetchall():
+        ).fetchall()
+        for lead in due_7d:
             phone = lead["phone_number"]
             name = lead["name"] or "Valued Client"
             expiry = lead["document_expiry_date"]

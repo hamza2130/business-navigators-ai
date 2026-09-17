@@ -1,3 +1,5 @@
+import json
+
 from groq import Groq
 from config import settings
 from kb_service import get_active_knowledge_context
@@ -5,6 +7,15 @@ from kb_service import get_active_knowledge_context
 client = Groq(api_key=settings.GROQ_API_KEY)
 
 FALLBACK_REPLY = "Our AI assistant is temporarily busy. Please try again in a moment!"
+
+# Sentinel the model is instructed to prefix its structured-extraction line
+# with. Chosen to be extremely unlikely to appear in ordinary conversation,
+# so a plain substring search is enough to locate it.
+LEAD_DATA_SENTINEL = "<<<LEAD_DATA>>>"
+# Field names here match database.leads's actual columns (business_type,
+# not business_activity) so the extracted dict can be passed straight
+# through to save_or_update_lead(**extracted) without remapping.
+_LEAD_DATA_FIELDS = ("name", "business_type", "turnover", "industry", "vat_status", "service_interest")
 
 
 class AIServiceError(Exception):
@@ -40,6 +51,21 @@ Guidelines:
 3. Naturally gather key lead details during the conversation (Client Name, Business Activity, Preferred Service Package, Timeline).
 4. If a client asks for a meeting or consultation, initiate the meeting booking process.
 5. If a required document is needed, prompt the client to upload it via WhatsApp/Email.
+
+STRUCTURED DATA (required on every reply, never shown to the client):
+After your visible reply, on its own final line, output exactly:
+{LEAD_DATA_SENTINEL}{{"name": null, "business_type": null, "turnover": null, "industry": null, "vat_status": null, "service_interest": null}}
+Fill in any field the client has stated or clearly implied ANYWHERE in this
+conversation (not just the latest message) with a short value; leave a
+field as null if it hasn't come up. business_type is the legal/registered
+type of business (e.g. "LLC", "sole proprietorship", "freelancer");
+industry is the kind of business activity (e.g. "e-commerce",
+"consulting"); vat_status means whether
+they are VAT-registered, need to register, or are unregistered;
+service_interest means which Business Navigators service they want (e.g.
+"company setup", "tax filing"). This line is machine-parsed and stripped
+before the client ever sees it - it must be valid JSON on one line, with
+no other text after it.
 """
 
 
@@ -78,3 +104,37 @@ def generate_ai_response(
             f"\n================ GROQ API ERROR ================\n{error_msg}\n================================================\n"
         )
         raise AIServiceError(error_msg) from e
+
+
+def strip_lead_data(raw_reply: str) -> tuple[str, dict]:
+    """Splits the model's raw reply into (visible_text, extracted_fields).
+
+    The system prompt instructs the model to end every reply with a
+    <<<LEAD_DATA>>>{...} line (FR-3 structured qualification). This finds
+    and removes that line so it's never shown to the client, and parses
+    whatever fields the model actually populated.
+
+    Extraction is a nice-to-have layered on top of the reply, never
+    something that can break it: a missing sentinel, malformed JSON, or an
+    unexpected shape all degrade to (full_reply, {}) rather than raising.
+    """
+    if not raw_reply or LEAD_DATA_SENTINEL not in raw_reply:
+        return raw_reply, {}
+
+    visible, _, tail = raw_reply.partition(LEAD_DATA_SENTINEL)
+    visible = visible.rstrip()
+
+    try:
+        parsed = json.loads(tail.strip())
+    except (ValueError, TypeError):
+        return visible, {}
+
+    if not isinstance(parsed, dict):
+        return visible, {}
+
+    extracted = {
+        field: str(value).strip()
+        for field, value in parsed.items()
+        if field in _LEAD_DATA_FIELDS and value not in (None, "", "null")
+    }
+    return visible, extracted

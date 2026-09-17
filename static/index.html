@@ -61,6 +61,69 @@
                 <div id="takeoverStatus" class="text-xs font-mono text-purple-300 mt-2"></div>
             </div>
 
+            <!-- Lead List -->
+            <div class="bg-zinc-950 border border-purple-900/40 rounded-xl p-5 space-y-4 shadow-lg shadow-purple-950/20 md:col-span-2">
+                <div class="flex items-center justify-between">
+                    <h2 class="text-lg font-semibold text-purple-200">Leads</h2>
+                    <button onclick="loadLeads()" class="text-xs text-purple-400 hover:text-purple-300">Refresh</button>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-xs text-left">
+                        <thead class="text-zinc-500 uppercase text-[10px]">
+                            <tr>
+                                <th class="py-1.5 pr-3">Identifier</th>
+                                <th class="py-1.5 pr-3">Tier</th>
+                                <th class="py-1.5 pr-3">Score</th>
+                                <th class="py-1.5 pr-3">State</th>
+                                <th class="py-1.5 pr-3">Name</th>
+                                <th class="py-1.5 pr-3">Industry</th>
+                                <th class="py-1.5 pr-3">Service Interest</th>
+                                <th class="py-1.5 pr-3">Doc Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="leadsBody" class="divide-y divide-zinc-900"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Scoring Rules -->
+            <div class="bg-zinc-950 border border-purple-900/40 rounded-xl p-5 space-y-4 shadow-lg shadow-purple-950/20">
+                <h2 class="text-lg font-semibold text-purple-200">Scoring Rules</h2>
+                <p class="text-xs text-zinc-400">Each keyword adds its weight to a lead's score when it appears in a message. Edits apply to the next message - no deploy needed.</p>
+
+                <form id="ruleForm" class="flex gap-2">
+                    <input type="text" id="ruleKeyword" placeholder="keyword" class="flex-1 bg-zinc-900 border border-zinc-800 rounded-lg p-2.5 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-purple-500 transition" required>
+                    <input type="number" id="ruleWeight" placeholder="weight" class="w-24 bg-zinc-900 border border-zinc-800 rounded-lg p-2.5 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-purple-500 transition" required>
+                    <button type="submit" class="bg-purple-600 hover:bg-purple-500 text-white font-medium px-4 rounded-lg transition">Add</button>
+                </form>
+                <div id="rulesList" class="space-y-1.5 max-h-52 overflow-y-auto pr-1"></div>
+            </div>
+
+            <!-- Thresholds & Booking Keywords -->
+            <div class="bg-zinc-950 border border-purple-900/40 rounded-xl p-5 space-y-5 shadow-lg shadow-purple-950/20">
+                <div>
+                    <h2 class="text-lg font-semibold text-purple-200">Hot / Medium / Low Thresholds</h2>
+                    <form id="thresholdForm" class="flex gap-2 mt-3">
+                        <label class="flex-1 text-xs text-zinc-400">Hot &ge;
+                            <input type="number" id="hotThreshold" class="w-full mt-1 bg-zinc-900 border border-zinc-800 rounded-lg p-2 text-sm text-white focus:outline-none focus:border-purple-500 transition" required>
+                        </label>
+                        <label class="flex-1 text-xs text-zinc-400">Medium &ge;
+                            <input type="number" id="mediumThreshold" class="w-full mt-1 bg-zinc-900 border border-zinc-800 rounded-lg p-2 text-sm text-white focus:outline-none focus:border-purple-500 transition" required>
+                        </label>
+                        <button type="submit" class="self-end bg-purple-600 hover:bg-purple-500 text-white text-sm font-medium px-4 py-2 rounded-lg transition">Save</button>
+                    </form>
+                </div>
+                <div class="pt-4 border-t border-zinc-800">
+                    <h2 class="text-lg font-semibold text-purple-200">Booking Keywords</h2>
+                    <p class="text-xs text-zinc-400 mt-1">Any of these in a message triggers the calendar-booking flow.</p>
+                    <form id="bookingKeywordForm" class="flex gap-2 mt-3">
+                        <input type="text" id="bookingKeyword" placeholder="keyword" class="flex-1 bg-zinc-900 border border-zinc-800 rounded-lg p-2.5 text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-purple-500 transition" required>
+                        <button type="submit" class="bg-purple-600 hover:bg-purple-500 text-white font-medium px-4 rounded-lg transition">Add</button>
+                    </form>
+                    <div id="bookingKeywordsList" class="flex flex-wrap gap-1.5 mt-3"></div>
+                </div>
+            </div>
+
         </div>
     </div>
 
@@ -155,7 +218,141 @@
             document.getElementById("takeoverStatus").innerText = json.message;
         }
 
+        function tierBadge(tier) {
+            const colors = {
+                HOT: "bg-red-950/80 text-red-300 border-red-500/30",
+                MEDIUM: "bg-amber-950/80 text-amber-300 border-amber-500/30",
+                LOW: "bg-zinc-900 text-zinc-400 border-zinc-700",
+            };
+            const cls = colors[tier] || colors.LOW;
+            const span = document.createElement("span");
+            span.className = `px-2 py-0.5 rounded-full text-[10px] font-semibold border ${cls}`;
+            span.textContent = tier || "-";
+            return span;
+        }
+
+        async function loadLeads() {
+            const res = await apiFetch(`${API_BASE}/admin/leads`);
+            const json = await res.json();
+            const tbody = document.getElementById("leadsBody");
+            tbody.innerHTML = "";
+            json.data.forEach(l => {
+                const tr = document.createElement("tr");
+                tr.className = "text-zinc-300";
+                const cell = (text) => {
+                    const td = document.createElement("td");
+                    td.className = "py-1.5 pr-3";
+                    td.textContent = text ?? "-";
+                    return td;
+                };
+                const tierTd = document.createElement("td");
+                tierTd.className = "py-1.5 pr-3";
+                tierTd.appendChild(tierBadge(l.lead_tier));
+
+                tr.append(
+                    cell(l.identifier), tierTd, cell(l.score), cell(l.state),
+                    cell(l.name), cell(l.industry), cell(l.service_interest), cell(l.document_status)
+                );
+                tbody.appendChild(tr);
+            });
+        }
+
+        async function loadScoringRules() {
+            const res = await apiFetch(`${API_BASE}/admin/scoring-rules`);
+            const json = await res.json();
+            const container = document.getElementById("rulesList");
+            container.innerHTML = "";
+            json.data.forEach(rule => {
+                const row = document.createElement("div");
+                row.className = "flex items-center justify-between bg-zinc-900 px-3 py-1.5 rounded-lg text-xs";
+                const label = document.createElement("span");
+                label.textContent = `${rule.keyword}  (+${rule.weight})`;
+                label.className = "text-zinc-300 font-mono";
+                const delBtn = document.createElement("button");
+                delBtn.textContent = "×";
+                delBtn.className = "text-purple-400 hover:text-red-400 font-bold ml-2";
+                delBtn.onclick = async () => {
+                    await apiFetch(`${API_BASE}/admin/scoring-rules/${rule.id}`, { method: "DELETE" });
+                    loadScoringRules();
+                };
+                row.append(label, delBtn);
+                container.appendChild(row);
+            });
+        }
+
+        document.getElementById("ruleForm").onsubmit = async (e) => {
+            e.preventDefault();
+            await apiFetch(`${API_BASE}/admin/scoring-rules`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    keyword: document.getElementById("ruleKeyword").value,
+                    weight: Number(document.getElementById("ruleWeight").value),
+                }),
+            });
+            document.getElementById("ruleForm").reset();
+            loadScoringRules();
+        };
+
+        async function loadBookingKeywords() {
+            const res = await apiFetch(`${API_BASE}/admin/booking-keywords`);
+            const json = await res.json();
+            const container = document.getElementById("bookingKeywordsList");
+            container.innerHTML = "";
+            json.data.forEach(kw => {
+                const chip = document.createElement("span");
+                chip.className = "flex items-center gap-1 bg-zinc-900 border border-zinc-800 px-2.5 py-1 rounded-full text-xs text-zinc-300";
+                const label = document.createElement("span");
+                label.textContent = kw.keyword;
+                const delBtn = document.createElement("button");
+                delBtn.textContent = "×";
+                delBtn.className = "text-purple-400 hover:text-red-400 font-bold";
+                delBtn.onclick = async () => {
+                    await apiFetch(`${API_BASE}/admin/booking-keywords/${kw.id}`, { method: "DELETE" });
+                    loadBookingKeywords();
+                };
+                chip.append(label, delBtn);
+                container.appendChild(chip);
+            });
+        }
+
+        document.getElementById("bookingKeywordForm").onsubmit = async (e) => {
+            e.preventDefault();
+            await apiFetch(`${API_BASE}/admin/booking-keywords`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ keyword: document.getElementById("bookingKeyword").value }),
+            });
+            document.getElementById("bookingKeywordForm").reset();
+            loadBookingKeywords();
+        };
+
+        async function loadThresholds() {
+            const res = await apiFetch(`${API_BASE}/admin/settings`);
+            const json = await res.json();
+            document.getElementById("hotThreshold").value = json.data.hot_threshold ?? "";
+            document.getElementById("mediumThreshold").value = json.data.medium_threshold ?? "";
+        }
+
+        document.getElementById("thresholdForm").onsubmit = async (e) => {
+            e.preventDefault();
+            await apiFetch(`${API_BASE}/admin/settings`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ key: "hot_threshold", value: document.getElementById("hotThreshold").value }),
+            });
+            await apiFetch(`${API_BASE}/admin/settings`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ key: "medium_threshold", value: document.getElementById("mediumThreshold").value }),
+            });
+        };
+
         loadKB();
+        loadLeads();
+        loadScoringRules();
+        loadBookingKeywords();
+        loadThresholds();
     </script>
 </body>
 </html>

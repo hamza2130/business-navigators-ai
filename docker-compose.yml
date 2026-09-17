@@ -1,4 +1,52 @@
 services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: business_navigators
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Applied automatically on first startup only (empty data dir) -
+      # creates every table, RLS policy, and the app_user role. Re-run it
+      # by hand (`psql -f schema.sql`) after a real schema change; this
+      # mount does not re-apply it to an existing volume.
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  # Local S3-compatible storage. In production, leave this out and point
+  # api/worker's S3_ENDPOINT_URL at real AWS S3 instead (see .env.example).
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   api:
     build: .
     ports:
@@ -6,13 +54,47 @@ services:
     env_file:
       - .env
     environment:
-      # SQLite file lives on the ./data volume below, not the image layer,
-      # so it survives `docker compose down` / rebuilds.
-      DB_NAME: /app/data/leads.db
-    volumes:
-      - ./data:/app/data
-      # Optional: mount a real Google service-account key for calendar
-      # booking. Uncomment once you have one - see .env.example
-      # (GOOGLE_CREDENTIALS_FILE).
-      # - ./credentials.json:/app/credentials.json:ro
+      # These override .env to point at the other containers by service
+      # name rather than localhost - everything else (Groq/Meta/Brevo
+      # keys, admin key, etc.) still comes from .env.
+      DATABASE_URL: postgresql://app_user:change_me_in_production@postgres:5432/business_navigators
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_healthy
     restart: unless-stopped
+
+  # Separate process from `api`, same image - consumes the queue `api`
+  # enqueues WhatsApp messages onto (see worker.py). Scale this
+  # independently of `api` for the "horizontally scalable workers" NFR:
+  # `docker compose up --scale worker=3`.
+  worker:
+    build: .
+    command: ["arq", "worker.WorkerSettings"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://app_user:change_me_in_production@postgres:5432/business_navigators
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  miniodata:
