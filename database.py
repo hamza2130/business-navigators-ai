@@ -93,12 +93,46 @@ def get_lead(phone_number: str) -> dict | None:
             """
             SELECT phone_number AS identifier, state, score, name, business_type,
                    document_id_number, document_expiry_date, document_status, human_takeover,
-                   turnover, industry, vat_status, service_interest, lead_tier, email
+                   turnover, industry, vat_status, service_interest, lead_tier, email,
+                   meeting_event_id, meeting_start, meeting_link
             FROM leads WHERE phone_number = %s
             """,
             (phone_number,),
         ).fetchone()
         return _dict_or_none(row)
+
+
+def set_meeting(phone_number: str, event_id: str, start_iso: str, link: str | None) -> None:
+    """Records the calendar event booked for this lead (creating the lead row
+    if this is their very first message). start_iso is a naive Asia/Dubai
+    wall-clock ISO string."""
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO leads (tenant_id, phone_number, meeting_event_id, meeting_start, meeting_link)
+            VALUES (%(tenant_id)s, %(phone_number)s, %(event_id)s, %(start)s, %(link)s)
+            ON CONFLICT (tenant_id, phone_number) DO UPDATE SET
+                meeting_event_id = excluded.meeting_event_id,
+                meeting_start = excluded.meeting_start,
+                meeting_link = excluded.meeting_link
+            """,
+            {"tenant_id": DEFAULT_TENANT_ID, "phone_number": phone_number,
+             "event_id": event_id, "start": start_iso, "link": link},
+        )
+
+
+def clear_meeting(phone_number: str) -> None:
+    """Forgets the lead's booked meeting (after it was cancelled). Needs its
+    own function because save_or_update_lead() can't set a field back to
+    NULL - it treats None as "leave unchanged"."""
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE leads SET meeting_event_id = NULL, meeting_start = NULL, meeting_link = NULL
+            WHERE tenant_id = %s AND phone_number = %s
+            """,
+            (DEFAULT_TENANT_ID, phone_number),
+        )
 
 
 def list_leads(limit: int = 200) -> list[dict]:
@@ -300,15 +334,8 @@ def delete_kb_item(item_id: int) -> None:
         conn.execute("DELETE FROM knowledge_base WHERE id = %s", (item_id,))
 
 
-def get_active_knowledge_context() -> str:
-    """Fetches active KB items formatted as prompt context. Lives here
-    (not kb_service.py) now that both share the same connection pool -
-    kb_service.py just re-exports this for backwards compatibility."""
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT category, topic, content FROM knowledge_base WHERE is_active = TRUE ORDER BY category"
-        ).fetchall()
-
+def format_kb_rows(rows: list[dict]) -> str:
+    """KB rows (ordered by category) as prompt context."""
     if not rows:
         return "No specific knowledge base records loaded."
 
@@ -319,6 +346,49 @@ def get_active_knowledge_context() -> str:
             formatted.append(f"\n--- Category: {current_category} ---")
         formatted.append(f"- {row['topic']}: {row['content']}")
     return "\n".join(formatted)
+
+
+def get_active_kb_rows() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT category, topic, content FROM knowledge_base WHERE is_active = TRUE ORDER BY category"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_active_knowledge_context() -> str:
+    """Every active KB item formatted as prompt context. Lives here (not
+    kb_service.py) now that both share the same connection pool."""
+    return format_kb_rows(get_active_kb_rows())
+
+
+def search_kb(terms: list[str], limit: int) -> list[dict]:
+    """Active KB items ranked by full-text relevance to ANY of `terms`
+    (PostgreSQL FTS, English stemming; topic weighs more than content, which
+    weighs more than the category name). `terms` must already be plain word
+    tokens - kb_service.py extracts them - so they are safe to join into a
+    tsquery. Returns [] when nothing matches."""
+    if not terms:
+        return []
+    tsquery = " | ".join(terms)
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT category, topic, content, ts_rank_cd(doc, q) AS rank
+            FROM (
+                SELECT category, topic, content,
+                       setweight(to_tsvector('english', topic), 'A') ||
+                       setweight(to_tsvector('english', content), 'B') ||
+                       setweight(to_tsvector('english', category), 'C') AS doc
+                FROM knowledge_base WHERE is_active = TRUE
+            ) kb, to_tsquery('english', %s) q
+            WHERE doc @@ q
+            ORDER BY rank DESC, topic
+            LIMIT %s
+            """,
+            (tsquery, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ==========================================================================
@@ -425,19 +495,23 @@ def create_document(
     size_bytes: int = None,
     extracted_expiry_date: str = None,
     status: str = "PENDING",
+    detected_type: str = None,
+    validation_flag: str = None,
 ) -> int:
     with get_conn() as conn:
         row = conn.execute(
             """
             INSERT INTO documents (
                 tenant_id, lead_phone_number, storage_key, original_filename,
-                content_type, size_bytes, extracted_expiry_date, status
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                content_type, size_bytes, extracted_expiry_date, status,
+                detected_type, validation_flag
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
                 DEFAULT_TENANT_ID, lead_phone_number, storage_key, original_filename,
                 content_type, size_bytes, extracted_expiry_date, status,
+                detected_type, validation_flag,
             ),
         ).fetchone()
         return row["id"]

@@ -43,11 +43,18 @@ CREATE TABLE IF NOT EXISTS leads (
     service_interest TEXT,
     lead_tier TEXT,
     email TEXT,
+    meeting_event_id TEXT,
+    meeting_start TEXT,
+    meeting_link TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, phone_number)
 );
--- For databases created before email existed (CREATE TABLE IF NOT EXISTS won't add it):
+-- For databases created before these columns existed (CREATE TABLE IF NOT EXISTS won't add them).
+-- meeting_start is the booked slot as a naive Asia/Dubai wall-clock ISO string.
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS email TEXT;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS meeting_event_id TEXT;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS meeting_start TEXT;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS meeting_link TEXT;
 ALTER TABLE leads ENABLE ROW LEVEL SECURITY;
 ALTER TABLE leads FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON leads;
@@ -156,6 +163,10 @@ CREATE TABLE IF NOT EXISTS documents (
     content_type TEXT,
     size_bytes INTEGER,
     extracted_expiry_date TEXT,
+    -- FR-7: best-guess document type and, when something looked off, why
+    -- (see document_validation.py - a heuristic, so staff still decide).
+    detected_type TEXT,
+    validation_flag TEXT,
     -- PENDING (uploaded, not yet reviewed) -> APPROVED / REJECTED by staff,
     -- or FAILED (OCR couldn't read it - see ocr_service.py).
     status TEXT NOT NULL DEFAULT 'PENDING'
@@ -165,6 +176,9 @@ CREATE TABLE IF NOT EXISTS documents (
     reviewed_at TIMESTAMPTZ,
     review_note TEXT
 );
+-- For databases created before these columns existed:
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS detected_type TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS validation_flag TEXT;
 CREATE INDEX IF NOT EXISTS idx_documents_lead ON documents(tenant_id, lead_phone_number);
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE documents FORCE ROW LEVEL SECURITY;

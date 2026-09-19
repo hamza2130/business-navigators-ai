@@ -184,12 +184,33 @@ def _reset_test_redis():
 # --------------------------------------------------------------------------
 # Recorder: captures everything the app tries to send to the outside world
 # --------------------------------------------------------------------------
-OUT = {"whatsapp": [], "brevo": [], "groq": [], "calendar": [], "media_get": []}
+OUT = {
+    "whatsapp": [], "brevo": [], "groq": [], "calendar": [], "media_get": [],
+    "calendar_patch": [], "calendar_delete": [],
+}
+
+# In-memory Google Calendar: events the app inserts become "busy" in later
+# freebusy queries, so double-booking is observable. extra_busy holds
+# (start, end) offset-bearing ISO pairs for things that aren't ours.
+CAL_DEFAULTS = {
+    "events": {}, "seq": 0, "extra_busy": [],
+    "freebusy_fail": False, "patch_fail": False, "delete_fail": False, "delete_gone": False,
+}
+CAL = {}
+
+
+def reset_calendar():
+    CAL.clear()
+    CAL.update({k: (type(v)() if isinstance(v, (dict, list)) else v) for k, v in CAL_DEFAULTS.items()})
 
 
 def reset_recorder():
     for v in OUT.values():
         v.clear()
+    reset_calendar()
+
+
+reset_calendar()
 
 
 # --------------------------------------------------------------------------
@@ -256,22 +277,87 @@ class _Credentials:
         return object()
 
 
+class _Exec:
+    def __init__(self, fn):
+        self._fn = fn
+
+    def execute(self):
+        return self._fn()
+
+
+class _GoneError(Exception):
+    """Mimics googleapiclient's HttpError for an already-deleted event."""
+
+    def __init__(self):
+        super().__init__("Resource has been deleted")
+        self.resp = type("Resp", (), {"status": 410})()
+
+
+def _naive_dubai_to_aware_iso(value: str) -> str:
+    import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.datetime.fromisoformat(value).replace(tzinfo=ZoneInfo("Asia/Dubai")).isoformat()
+
+
 class _Events:
     def insert(self, calendarId=None, body=None, sendUpdates=None):
         OUT["calendar"].append(
             {"calendarId": calendarId, "body": body, "sendUpdates": sendUpdates}
         )
+        CAL["seq"] += 1
+        event_id = f"evt{CAL['seq']}"
+        CAL["events"][event_id] = (body["start"]["dateTime"], body["end"]["dateTime"])
+        return _Exec(lambda: {"id": event_id, "htmlLink": "https://calendar.google.com/event?eid=FAKE123"})
 
-        class _Exec:
-            def execute(_self):
-                return {"htmlLink": "https://calendar.google.com/event?eid=FAKE123"}
+    def patch(self, calendarId=None, eventId=None, body=None, sendUpdates=None):
+        OUT["calendar_patch"].append(
+            {"calendarId": calendarId, "eventId": eventId, "body": body, "sendUpdates": sendUpdates}
+        )
 
-        return _Exec()
+        def run():
+            if CAL["patch_fail"]:
+                raise RuntimeError("simulated calendar patch failure")
+            CAL["events"][eventId] = (body["start"]["dateTime"], body["end"]["dateTime"])
+            return {"id": eventId, "htmlLink": "https://calendar.google.com/event?eid=FAKE123"}
+
+        return _Exec(run)
+
+    def delete(self, calendarId=None, eventId=None, sendUpdates=None):
+        OUT["calendar_delete"].append(
+            {"calendarId": calendarId, "eventId": eventId, "sendUpdates": sendUpdates}
+        )
+
+        def run():
+            if CAL["delete_fail"]:
+                raise RuntimeError("simulated calendar delete failure")
+            if CAL["delete_gone"]:
+                raise _GoneError()
+            CAL["events"].pop(eventId, None)
+            return ""
+
+        return _Exec(run)
+
+
+class _FreeBusy:
+    def query(self, body=None):
+        def run():
+            if CAL["freebusy_fail"]:
+                raise RuntimeError("simulated freebusy failure")
+            busy = [
+                {"start": _naive_dubai_to_aware_iso(a), "end": _naive_dubai_to_aware_iso(b)}
+                for a, b in CAL["events"].values()
+            ] + [{"start": a, "end": b} for a, b in CAL["extra_busy"]]
+            return {"calendars": {body["items"][0]["id"]: {"busy": busy}}}
+
+        return _Exec(run)
 
 
 class _Service:
     def events(self):
         return _Events()
+
+    def freebusy(self):
+        return _FreeBusy()
 
 
 def _build(serviceName, version, credentials=None):

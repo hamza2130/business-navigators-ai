@@ -7,12 +7,13 @@ An intelligent, multi-service backend powered by **FastAPI** that integrates wit
 ## Key Features
 
 - **WhatsApp Cloud API Integration:** Signed webhook receiver handling text messages, media files, and dynamic routing. Inbound messages are enqueued to Redis and handled by a separate `worker.py` process, so Meta's delivery is acknowledged immediately and a message survives an app restart instead of being lost.
-- **AI Service Integration:** Conversational context kept across a thread and passed to Groq LLM inference on every reply, which also extracts structured lead-qualification fields (name, industry, VAT status, service interest) from natural conversation.
-- **Document Parsing, OCR & Storage:** Automated text extraction from uploaded images and documents (PDF, Word, Excel), with expiry-date extraction that looks for the actual "expiry" label rather than just the first date on the page. The original file is stored privately in S3-compatible object storage, accessible only via short-lived signed URLs, and queued for staff review.
-- **Calendar & Email Automation:** Google Calendar booking (Asia/Dubai) and automated transactional/notification email delivery via Brevo.
-- **Compliance Reminders:** A daily scheduled job tracks document expiry and sends WhatsApp reminders 30 and 7 days out, resilient to a missed run.
+- **AI Service Integration:** Conversational context kept across a thread and passed to Groq LLM inference on every reply, which also extracts structured lead-qualification fields (name, industry, VAT status, service interest, email) from natural conversation. The Knowledge Base is sent whole while it is small; once it outgrows the prompt budget only the entries relevant to the client's message are retrieved (PostgreSQL full-text search - keyword/stemming based, not semantic embeddings), and a question with no relevant entry is escalated to staff instead of guessed at.
+- **Document Parsing, OCR & Storage:** Automated text extraction from uploaded images and documents (PDF, Word, Excel), with expiry-date extraction that looks for the actual "expiry" label rather than just the first date on the page. The original file is stored privately in S3-compatible object storage, accessible only via short-lived signed URLs, and queued for staff review. A heuristic check also guesses the document type (passport, Emirates ID, trade licence, residence visa, VAT certificate) and flags anything unrecognised, expired, or outside the accepted list (`accepted_document_types` setting) - the flag goes to staff and the client, but it never rejects a document by itself: staff decide.
+- **Calendar & Email Automation:** Google Calendar booking (Asia/Dubai) that checks the consultant's real availability (working hours, weekends skipped, no double-booking), lets a client reschedule or cancel by message, and sends notification email via Brevo.
+- **Compliance Reminders:** A daily scheduled job tracks document expiry and sends reminders 30 and 7 days out over WhatsApp and email (whichever channels we have for the lead), resilient to a missed run and retried if delivery fails.
 - **Multi-Tenant PostgreSQL:** Every table enforces tenant isolation via Row-Level Security at the database layer, not just application code - a second tenant can be added with zero schema changes.
-- **Admin Dashboard:** Key-protected staff UI for managing the knowledge base, scoring rules, lead list, and pausing AI replies per lead.
+- **Human Escalation:** When the AI isn't confident it can answer from the Knowledge Base (or the client asks for a person / raises something sensitive) it pauses itself for that lead and notifies staff with the reason; the client still gets a helpful reply.
+- **Admin Dashboard:** Key-protected staff UI for managing the knowledge base, scoring rules, lead list, full conversation transcripts, KPIs, and pausing AI replies per lead. Every staff action is recorded in an audit log.
 
 ---
 
@@ -141,6 +142,8 @@ The email webhook lives at `https://your-ngrok-url.ngrok-free.app/webhook/email`
 ### Admin Dashboard
 
 Open `https://your-host/dashboard/?key=<your ADMIN_API_KEY>`. The key is required - the dashboard and every `/admin/*` API route return `401` without it.
+
+The dashboard asks who you are and sends that as an `X-Actor` header on every change, so the audit log (`GET /admin/audit-log`) records *which staff member* did what. Other read endpoints: `/admin/kpis` (lead/state/tier counts, awaiting-human count) and `/admin/leads/{identifier}/transcript`.
 
 ---
 
