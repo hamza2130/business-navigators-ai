@@ -42,9 +42,12 @@ CREATE TABLE IF NOT EXISTS leads (
     vat_status TEXT,
     service_interest TEXT,
     lead_tier TEXT,
+    email TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, phone_number)
 );
+-- For databases created before email existed (CREATE TABLE IF NOT EXISTS won't add it):
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS email TEXT;
 ALTER TABLE leads ENABLE ROW LEVEL SECURITY;
 ALTER TABLE leads FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON leads;
@@ -183,6 +186,31 @@ ALTER TABLE document_access_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE document_access_log FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON document_access_log;
 CREATE POLICY tenant_isolation ON document_access_log
+    USING (tenant_id = current_setting('app.tenant_id', true))
+    WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+-- Staff action audit trail (SRS NFR: "Audit logging of staff actions and
+-- document access" - document access itself is document_access_log above;
+-- this covers everything else staff can change through /admin/*). There's
+-- no per-staff login yet (a shared ADMIN_API_KEY gates the whole admin
+-- surface), so `actor` is a free-text name the caller supplies (the
+-- dashboard asks for one once and remembers it) rather than a verified
+-- identity - good enough to answer "who changed this" in the common case,
+-- not a substitute for real per-staff auth.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) DEFAULT current_setting('app.tenant_id', true),
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target TEXT,
+    detail TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(tenant_id, created_at DESC);
+ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_log FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON audit_log;
+CREATE POLICY tenant_isolation ON audit_log
     USING (tenant_id = current_setting('app.tenant_id', true))
     WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 

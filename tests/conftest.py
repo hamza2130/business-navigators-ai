@@ -89,7 +89,7 @@ def _reset_test_database():
         with psycopg.connect(TEST_SUPERUSER_URL, autocommit=True) as conn:
             conn.execute(
                 "TRUNCATE leads, knowledge_base, messages, scoring_rules, "
-                "booking_keywords, app_settings, documents, document_access_log "
+                "booking_keywords, app_settings, documents, document_access_log, audit_log "
                 "RESTART IDENTITY CASCADE"
             )
             conn.execute(
@@ -118,9 +118,21 @@ def _reset_test_database():
 def _reset_test_bucket():
     """Empties the test S3 bucket between tests (creating it first time
     round). A separate boto3 client here, not document_store's cached one -
-    this runs before the app's own client would otherwise lazily create it."""
+    this runs before the app's own client would otherwise lazily create it.
+
+    Bucket creation delegates to document_store.ensure_bucket() rather than
+    calling client.create_bucket() directly here: a bare create_bucket()
+    needs an explicit CreateBucketConfiguration/LocationConstraint for any
+    region other than us-east-1 (moto enforces this correctly, and
+    ensure_bucket() already handles it) - a previous version of this
+    function called create_bucket() directly and hung/errored on a fresh
+    moto instance with no bucket yet, since that path was never actually
+    exercised until the bucket didn't already exist from a prior run.
+    """
     import boto3
     from botocore.exceptions import ClientError
+
+    import document_store
 
     client = boto3.client(
         "s3",
@@ -133,11 +145,11 @@ def _reset_test_bucket():
         client.head_bucket(Bucket=TEST_S3_BUCKET)
     except ClientError:
         try:
-            client.create_bucket(Bucket=TEST_S3_BUCKET)
-        except ClientError:
+            document_store.ensure_bucket()
+        except Exception as e:
             pytest.exit(
                 f"\nCannot reach the test S3 endpoint at {TEST_S3_ENDPOINT_URL}.\n"
-                f"See tests/README.md to start it.",
+                f"See tests/README.md to start it. Original error: {e}",
                 returncode=1,
             )
         return

@@ -93,7 +93,7 @@ def get_lead(phone_number: str) -> dict | None:
             """
             SELECT phone_number AS identifier, state, score, name, business_type,
                    document_id_number, document_expiry_date, document_status, human_takeover,
-                   turnover, industry, vat_status, service_interest, lead_tier
+                   turnover, industry, vat_status, service_interest, lead_tier, email
             FROM leads WHERE phone_number = %s
             """,
             (phone_number,),
@@ -159,6 +159,7 @@ def save_or_update_lead(
     vat_status: str = None,
     service_interest: str = None,
     lead_tier: str = None,
+    email: str = None,
 ) -> None:
     """Partial upsert: only fields explicitly passed (non-None) are
     written; a field left None is untouched on an existing lead and takes
@@ -189,6 +190,7 @@ def save_or_update_lead(
                 vat_status = COALESCE(%(vat_status)s, vat_status),
                 service_interest = COALESCE(%(service_interest)s, service_interest),
                 lead_tier = COALESCE(%(lead_tier)s, lead_tier),
+                email = COALESCE(%(email)s, email),
                 reminder_30d_sent_at = CASE WHEN %(document_expiry_date)s IS NOT NULL THEN NULL ELSE reminder_30d_sent_at END,
                 reminder_7d_sent_at = CASE WHEN %(document_expiry_date)s IS NOT NULL THEN NULL ELSE reminder_7d_sent_at END
             WHERE tenant_id = %(tenant_id)s AND phone_number = %(phone_number)s
@@ -209,6 +211,7 @@ def save_or_update_lead(
                 "vat_status": vat_status,
                 "service_interest": service_interest,
                 "lead_tier": lead_tier,
+                "email": email,
             },
         )
 
@@ -487,3 +490,71 @@ def log_document_access(document_id: int, accessed_by: str) -> None:
             "INSERT INTO document_access_log (tenant_id, document_id, accessed_by) VALUES (%s, %s, %s)",
             (DEFAULT_TENANT_ID, document_id, accessed_by),
         )
+
+
+# ==========================================================================
+# Staff audit trail (SRS NFR: "Audit logging of staff actions")
+# ==========================================================================
+def log_audit_event(actor: str, action: str, target: str = None, detail: str = None) -> None:
+    """Records one staff action (who, what, on what, and any detail).
+    Best-effort by design at the call site: a failure to write the audit
+    row must never block or undo the action it describes, so callers wrap
+    this in their own try/except (see main.py's _audit helper)."""
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO audit_log (tenant_id, actor, action, target, detail) VALUES (%s, %s, %s, %s, %s)",
+            (DEFAULT_TENANT_ID, actor, action, target, detail),
+        )
+
+
+def list_audit_log(limit: int = 100) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, actor, action, target, detail, created_at FROM audit_log "
+            "ORDER BY created_at DESC, id DESC LIMIT %s",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ==========================================================================
+# Dashboard: transcripts + KPIs (FR-12)
+# ==========================================================================
+def get_transcript(identifier: str, limit: int = 500) -> list[dict]:
+    """Full conversation for one lead, oldest first, across both channels
+    (each row carries its channel so the UI can show where it came from)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT role, channel, content, created_at FROM messages
+            WHERE identifier = %s
+            ORDER BY created_at ASC, id ASC
+            LIMIT %s
+            """,
+            (identifier, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_dashboard_kpis() -> dict:
+    """Headline numbers for the staff dashboard, all computed live from the
+    tenant's own rows (RLS scopes every query below to the current tenant)."""
+    with get_conn() as conn:
+        def scalar(sql, params=()):
+            row = conn.execute(sql, params).fetchone()
+            return list(row.values())[0]
+
+        def grouped(sql):
+            return {r["k"] or "UNSET": r["n"] for r in conn.execute(sql).fetchall()}
+
+        return {
+            "total_leads": scalar("SELECT count(*) FROM leads"),
+            "leads_by_state": grouped("SELECT state AS k, count(*) AS n FROM leads GROUP BY state"),
+            "leads_by_tier": grouped("SELECT lead_tier AS k, count(*) AS n FROM leads GROUP BY lead_tier"),
+            "awaiting_human": scalar("SELECT count(*) FROM leads WHERE human_takeover = TRUE"),
+            "documents_by_status": grouped("SELECT status AS k, count(*) AS n FROM documents GROUP BY status"),
+            "messages_last_24h": scalar(
+                "SELECT count(*) FROM messages WHERE created_at > now() - interval '24 hours'"
+            ),
+            "meetings_requested": scalar("SELECT count(*) FROM leads WHERE state = 'MEETING_REQUESTED'"),
+        }

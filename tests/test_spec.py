@@ -197,11 +197,10 @@ class TestConversation:
         assert any(a.get("email") == "lead@example.com" for a in attendees)
 
     def test_whatsapp_booking_has_no_attendee_yet(self, client):
-        """Known, acknowledged gap: WhatsApp leads are identified by phone
-        number, and structured lead capture (to collect a real email
-        address - FR-3) isn't built yet, so no attendee can be added on
-        this channel. This test documents the current, intentional
-        limitation rather than silently letting it regress further."""
+        """A WhatsApp lead is identified by phone number, so until the AI has
+        captured an email address from them (see test_reminders_email.py's
+        TestEmailCapture) there is no one to invite. Booking still works -
+        just without an attendee."""
         post_whatsapp_webhook(client, meta_text_payload("971500000005", "book appointment"))
         events = calendar_events_for("971500000005")
         assert len(events) == 1
