@@ -20,6 +20,9 @@
             </span>
         </header>
 
+        <!-- KPIs -->
+        <div id="kpiStrip" class="grid grid-cols-2 md:grid-cols-6 gap-3"></div>
+
         <!-- Main Grid -->
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
             
@@ -86,6 +89,32 @@
                 </div>
             </div>
 
+            <!-- Transcript (opens when a lead row is clicked) -->
+            <div id="transcriptPanel" class="hidden bg-zinc-950 border border-purple-900/40 rounded-xl p-5 space-y-3 shadow-lg shadow-purple-950/20 md:col-span-2">
+                <div class="flex items-center justify-between">
+                    <h2 id="transcriptTitle" class="text-lg font-semibold text-purple-200">Transcript</h2>
+                    <button onclick="document.getElementById('transcriptPanel').classList.add('hidden')" class="text-xs text-zinc-400 hover:text-zinc-200">Close</button>
+                </div>
+                <div id="transcriptBody" class="space-y-2 max-h-96 overflow-y-auto pr-1"></div>
+            </div>
+
+            <!-- Audit log -->
+            <div class="bg-zinc-950 border border-purple-900/40 rounded-xl p-5 space-y-3 shadow-lg shadow-purple-950/20 md:col-span-2">
+                <div class="flex items-center justify-between">
+                    <h2 class="text-lg font-semibold text-purple-200">Recent staff activity</h2>
+                    <button onclick="loadAudit()" class="text-xs text-purple-400 hover:text-purple-300">Refresh</button>
+                </div>
+                <div class="overflow-x-auto max-h-64 overflow-y-auto">
+                    <table class="w-full text-xs text-left">
+                        <thead class="text-zinc-500 uppercase text-[10px]"><tr>
+                            <th class="py-1.5 pr-3">When</th><th class="py-1.5 pr-3">Who</th>
+                            <th class="py-1.5 pr-3">Action</th><th class="py-1.5 pr-3">Target</th><th class="py-1.5 pr-3">Detail</th>
+                        </tr></thead>
+                        <tbody id="auditBody" class="divide-y divide-zinc-900"></tbody>
+                    </table>
+                </div>
+            </div>
+
             <!-- Scoring Rules -->
             <div class="bg-zinc-950 border border-purple-900/40 rounded-xl p-5 space-y-4 shadow-lg shadow-purple-950/20">
                 <h2 class="text-lg font-semibold text-purple-200">Scoring Rules</h2>
@@ -134,7 +163,15 @@
         // ?key=... in the URL) is reused as X-Admin-Key on every API call -
         // the /admin/* routes are protected by the same key server-side.
         const ADMIN_KEY = new URLSearchParams(window.location.search).get("key") || "";
-        const authHeaders = (extra = {}) => ({ "X-Admin-Key": ADMIN_KEY, ...extra });
+        // No per-staff login yet (one shared admin key), so ask for a name once and
+        // send it as X-Actor - it lands in the audit trail as "who did this".
+        let ACTOR = "";
+        try { ACTOR = localStorage.getItem("bn_actor") || ""; } catch (e) {}
+        if (!ACTOR) {
+            ACTOR = (window.prompt("Your name (recorded in the audit log for changes you make):") || "admin").trim() || "admin";
+            try { localStorage.setItem("bn_actor", ACTOR); } catch (e) {}
+        }
+        const authHeaders = (extra = {}) => ({ "X-Admin-Key": ADMIN_KEY, "X-Actor": ACTOR, ...extra });
 
         async function apiFetch(url, options = {}) {
             const res = await fetch(url, {
@@ -238,7 +275,9 @@
             tbody.innerHTML = "";
             json.data.forEach(l => {
                 const tr = document.createElement("tr");
-                tr.className = "text-zinc-300";
+                tr.className = "text-zinc-300 cursor-pointer hover:bg-zinc-900/60";
+                tr.title = "Click to read the conversation";
+                tr.onclick = () => openTranscript(l.identifier);
                 const cell = (text) => {
                     const td = document.createElement("td");
                     td.className = "py-1.5 pr-3";
@@ -353,6 +392,73 @@
         loadScoringRules();
         loadBookingKeywords();
         loadThresholds();
+
+        function el(tag, cls, text) {
+            const e = document.createElement(tag);
+            if (cls) e.className = cls;
+            if (text !== undefined) e.textContent = text;
+            return e;
+        }
+
+        async function loadKpis() {
+            const res = await apiFetch(`${API_BASE}/admin/kpis`);
+            const k = (await res.json()).data;
+            const strip = document.getElementById("kpiStrip");
+            strip.innerHTML = "";
+            const tier = k.leads_by_tier || {};
+            const docs = k.documents_by_status || {};
+            const tiles = [
+                ["Leads", k.total_leads, ""],
+                ["Hot", tier.HOT || 0, "text-red-300"],
+                ["Waiting on a human", k.awaiting_human, k.awaiting_human ? "text-amber-300" : ""],
+                ["Meetings requested", k.meetings_requested, ""],
+                ["Docs to review", docs.PENDING || 0, (docs.PENDING || 0) ? "text-amber-300" : ""],
+                ["Messages (24h)", k.messages_last_24h, ""],
+            ];
+            tiles.forEach(([label, value, cls]) => {
+                const t = el("div", "bg-zinc-950 border border-purple-900/40 rounded-xl px-4 py-3");
+                t.append(el("div", "text-[10px] uppercase tracking-wide text-zinc-500", label),
+                         el("div", "text-2xl font-semibold mt-1 " + cls, String(value)));
+                strip.appendChild(t);
+            });
+        }
+
+        async function openTranscript(identifier) {
+            const res = await apiFetch(`${API_BASE}/admin/leads/${encodeURIComponent(identifier)}/transcript`);
+            const rows = (await res.json()).data;
+            document.getElementById("transcriptTitle").textContent = `Conversation with ${identifier}`;
+            const body = document.getElementById("transcriptBody");
+            body.innerHTML = "";
+            if (!rows.length) body.appendChild(el("p", "text-xs text-zinc-500", "No messages recorded yet."));
+            rows.forEach(m => {
+                const mine = m.role === "assistant";
+                const bubble = el("div", "max-w-[80%] rounded-lg px-3 py-2 text-xs " +
+                    (mine ? "bg-purple-900/40 text-purple-100 ml-auto" : "bg-zinc-900 text-zinc-200"));
+                bubble.append(el("div", "whitespace-pre-wrap", m.content),
+                              el("div", "text-[10px] text-zinc-500 mt-1", `${mine ? "AI" : "Client"} · ${m.channel} · ${new Date(m.created_at).toLocaleString()}`));
+                body.appendChild(bubble);
+            });
+            const panel = document.getElementById("transcriptPanel");
+            panel.classList.remove("hidden");
+            panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        }
+
+        async function loadAudit() {
+            const res = await apiFetch(`${API_BASE}/admin/audit-log?limit=50`);
+            const rows = (await res.json()).data;
+            const tbody = document.getElementById("auditBody");
+            tbody.innerHTML = "";
+            rows.forEach(r => {
+                const tr = el("tr", "text-zinc-300");
+                [new Date(r.created_at).toLocaleString(), r.actor, r.action, r.target || "-", r.detail || "-"].forEach(v => {
+                    tr.appendChild(el("td", "py-1.5 pr-3", v));
+                });
+                tbody.appendChild(tr);
+            });
+        }
+
+        loadKpis();
+        loadAudit();
     </script>
 </body>
 </html>

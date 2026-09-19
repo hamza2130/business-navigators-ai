@@ -45,6 +45,22 @@ class Settings:
     GOOGLE_CALENDAR_ID: str = os.getenv("GOOGLE_CALENDAR_ID", "primary")
     GOOGLE_CREDENTIALS_FILE: str = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
 
+    # Knowledge-base retrieval (FR-9). While the active KB fits in
+    # KB_FULL_CONTEXT_MAX_CHARS the whole thing goes into the prompt (nothing
+    # to miss); beyond that only the KB_RETRIEVAL_TOP_K entries most relevant
+    # to the client's message are sent - see kb_service.py.
+    KB_FULL_CONTEXT_MAX_CHARS: int = int(os.getenv("KB_FULL_CONTEXT_MAX_CHARS", "6000"))
+    KB_RETRIEVAL_TOP_K: int = int(os.getenv("KB_RETRIEVAL_TOP_K", "5"))
+
+    # Consultation scheduling (FR-5). Slots are offered inside these Asia/Dubai
+    # working hours on these weekdays (0=Mon .. 6=Sun; UAE weekend is Sat/Sun),
+    # starting tomorrow, looking MEETING_SEARCH_DAYS ahead for a free slot.
+    MEETING_START_HOUR: int = int(os.getenv("MEETING_START_HOUR", "10"))
+    MEETING_END_HOUR: int = int(os.getenv("MEETING_END_HOUR", "17"))
+    MEETING_DURATION_MINUTES: int = int(os.getenv("MEETING_DURATION_MINUTES", "30"))
+    MEETING_WORKDAYS: str = os.getenv("MEETING_WORKDAYS", "0,1,2,3,4")
+    MEETING_SEARCH_DAYS: int = int(os.getenv("MEETING_SEARCH_DAYS", "14"))
+
     # Admin API key - required on every /admin/* route and /test-scheduler.
     # Sent as `X-Admin-Key: <value>`. No default: an empty value means those
     # routes refuse every request until this is actually configured.

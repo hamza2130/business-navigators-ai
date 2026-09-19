@@ -42,9 +42,19 @@ CREATE TABLE IF NOT EXISTS leads (
     vat_status TEXT,
     service_interest TEXT,
     lead_tier TEXT,
+    email TEXT,
+    meeting_event_id TEXT,
+    meeting_start TEXT,
+    meeting_link TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, phone_number)
 );
+-- For databases created before these columns existed (CREATE TABLE IF NOT EXISTS won't add them).
+-- meeting_start is the booked slot as a naive Asia/Dubai wall-clock ISO string.
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS email TEXT;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS meeting_event_id TEXT;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS meeting_start TEXT;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS meeting_link TEXT;
 ALTER TABLE leads ENABLE ROW LEVEL SECURITY;
 ALTER TABLE leads FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON leads;
@@ -153,6 +163,10 @@ CREATE TABLE IF NOT EXISTS documents (
     content_type TEXT,
     size_bytes INTEGER,
     extracted_expiry_date TEXT,
+    -- FR-7: best-guess document type and, when something looked off, why
+    -- (see document_validation.py - a heuristic, so staff still decide).
+    detected_type TEXT,
+    validation_flag TEXT,
     -- PENDING (uploaded, not yet reviewed) -> APPROVED / REJECTED by staff,
     -- or FAILED (OCR couldn't read it - see ocr_service.py).
     status TEXT NOT NULL DEFAULT 'PENDING'
@@ -162,6 +176,9 @@ CREATE TABLE IF NOT EXISTS documents (
     reviewed_at TIMESTAMPTZ,
     review_note TEXT
 );
+-- For databases created before these columns existed:
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS detected_type TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS validation_flag TEXT;
 CREATE INDEX IF NOT EXISTS idx_documents_lead ON documents(tenant_id, lead_phone_number);
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE documents FORCE ROW LEVEL SECURITY;
@@ -183,6 +200,31 @@ ALTER TABLE document_access_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE document_access_log FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation ON document_access_log;
 CREATE POLICY tenant_isolation ON document_access_log
+    USING (tenant_id = current_setting('app.tenant_id', true))
+    WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
+
+-- Staff action audit trail (SRS NFR: "Audit logging of staff actions and
+-- document access" - document access itself is document_access_log above;
+-- this covers everything else staff can change through /admin/*). There's
+-- no per-staff login yet (a shared ADMIN_API_KEY gates the whole admin
+-- surface), so `actor` is a free-text name the caller supplies (the
+-- dashboard asks for one once and remembers it) rather than a verified
+-- identity - good enough to answer "who changed this" in the common case,
+-- not a substitute for real per-staff auth.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) DEFAULT current_setting('app.tenant_id', true),
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target TEXT,
+    detail TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(tenant_id, created_at DESC);
+ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_log FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON audit_log;
+CREATE POLICY tenant_isolation ON audit_log
     USING (tenant_id = current_setting('app.tenant_id', true))
     WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
 

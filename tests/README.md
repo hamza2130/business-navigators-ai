@@ -1,8 +1,14 @@
 # Test suite — business-navigators-ai
 
-77 specification tests plus 9 multi-tenancy/RLS proofs. Every external
-third-party service (Groq, Meta Graph, Brevo, Google Calendar, Tesseract)
-is stubbed - no API keys or network calls needed for those. **Postgres,
+Specification tests (`test_spec.py`, including the multi-tenancy/RLS proofs)
+plus one module per later feature: `test_escalation_audit.py` (escalation,
+audit log, dashboard data), `test_reminders_email.py` (email reminders and
+email capture) and `test_meetings.py` (availability-checked booking,
+reschedule, cancel). Every external third-party service (Groq, Meta Graph,
+Brevo, Google Calendar, Tesseract) is stubbed - no API keys or network calls
+needed for those. The Google Calendar stub is a small in-memory calendar (see
+`CAL` in `conftest.py`): events the app inserts show up as busy in later
+free/busy queries, so double-booking is actually observable. **Postgres,
 Redis, and an S3-compatible endpoint are real dependencies**, not stubbed,
 because the whole point of Phase 2 was proving multi-tenancy (RLS),
 document storage, and the job queue actually work, not just that the code
@@ -22,6 +28,11 @@ psql -d business_navigators_test -f ../schema.sql
 Point the suite at it via `TEST_DATABASE_URL` / `TEST_SUPERUSER_URL` (see
 `conftest.py` for defaults - they assume a local instance on port 5544;
 override if yours is elsewhere, e.g. the standard 5432).
+
+If you run these services from a scratch/temp directory, keep the data
+somewhere that isn't age-pruned by your OS or tooling - a Postgres data
+directory that gets partly deleted mid-session fails in confusing ways
+(this repo's `.gitignore` reserves `.devservices/` for exactly that).
 
 ### 2. An S3-compatible endpoint
 
